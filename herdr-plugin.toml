@@ -1,0 +1,44 @@
+id = "weston.herdr-mission"
+name = "Herdr Mission"
+version = "0.1.0"
+description = "独立 Rust Team Mission runtime：创建、运行、恢复与管理团队 Mission，与 Herdr Kit 和 Python 完全解耦。"
+min_herdr_version = "0.7.5"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["mise", "exec", "rust@1.88.0", "--", "cargo", "build", "--release", "--locked"]
+
+[[startup]]
+command = ["bash", "events/reconcile-delivery.sh"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "mission-new"
+title = "新建 Team Mission"
+description = "用独立 Rust runtime 创建并启动一个团队 Mission。"
+contexts = ["global"]
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/actions/mission-new.sh\""]
+
+[[actions]]
+id = "mission-doctor"
+title = "Mission 自检"
+description = "校验 herdr-mission 数据库、binary 与 daemon 一致性。"
+contexts = ["global"]
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-mission\" doctor"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["bash", "events/reconcile-delivery.sh"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bash", "events/reconcile-delivery.sh"]
+
+[[panes]]
+id = "dashboard"
+title = "Mission 看板"
+description = "只读查看所有 Mission 及其阶段。"
+placement = "popup"
+width = "78%"
+height = "80%"
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/panes/dashboard.sh\""]
