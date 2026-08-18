@@ -6,7 +6,7 @@ min_herdr_version = "0.7.5"
 platforms = ["macos", "linux"]
 
 [[build]]
-command = ["mise", "exec", "rust@1.88.0", "--", "cargo", "build", "--release", "--locked"]
+command = ["bash", "fetch-or-build.sh"]
 
 [[startup]]
 command = ["bash", "events/reconcile-delivery.sh"]

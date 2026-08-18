@@ -11,13 +11,14 @@
 herdr plugin install gxbsst/herdr-mission --ref v0.1.0
 ```
 
-安装时 herdr 会 clone 本仓库，并执行 `herdr-plugin.toml` 里的 `[[build]]` 编译
-release 二进制。
+安装时 herdr 会 clone 本仓库，执行 `fetch-or-build.sh`：优先从 GitHub Releases 下载
+匹配版本+平台的预编译二进制并校验 SHA-256，下载失败才回退到源码编译。
 
 ## 前置依赖
 
 - [herdr](https://herdr.dev) ≥ 0.7.5
-- [mise](https://mise.jdx.dev) + Rust 1.88.0（`mise use rust@1.88.0`），编译需要
+- 有预编译二进制时无需 Rust；仅当回退源码编译时才需要 Rust 1.88.0
+- [mise](https://mise.jdx.dev) + Rust 1.88.0（`mise use rust@1.88.0`），仅在本地构建/回退编译时需要
 
 二进制本身是单一 `arm64` 可执行文件，运行时无外部依赖。
 
@@ -29,6 +30,17 @@ mise exec rust@1.88.0 -- cargo test --locked
 ```
 
 产物在 `target/release/herdr-mission`。
+
+## 发布
+
+打 `v*` tag 并 push 会触发 `.github/workflows/release.yml`，编译三个平台
+（macOS arm64 / macOS x86_64 / Linux x86_64-musl）并上传到 GitHub Release，
+同时生成 `SHA256SUMS` 和 `COMMIT` 供 `fetch-or-build.sh` 校验。
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## 命令
 
