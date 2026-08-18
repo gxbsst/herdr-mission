@@ -48,6 +48,21 @@ download() { # download <url> <dest>
   fi
 }
 
+# Download a release asset by name for the given tag. Prefers `gh release
+# download` because it goes through the authenticated API (required for a
+# private repo); falls back to the public direct URL via curl/wget.
+release_asset() { # release_asset <tag> <asset-name> <dest-file>
+  local tag="$1" asset="$2" dest="$3"
+  if have gh && gh auth token >/dev/null 2>&1; then
+    if gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$tmpdir" --clobber >/dev/null 2>&1; then
+      if [ -f "$tmpdir/$asset" ]; then
+        mv -f "$tmpdir/$asset" "$dest" && return 0
+      fi
+    fi
+  fi
+  download "$base_url/$tag/$asset" "$dest"
+}
+
 sha256_of() {
   if have sha256sum; then
     sha256sum "$1" | awk '{print $1}'
@@ -93,20 +108,18 @@ trap 'rm -rf "$tmpdir"' EXIT
 # fire only when the source IS the released commit.
 if have git && git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   head_rev=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo nohead)
-  download "$base_url/v$version/COMMIT" "$tmpdir/COMMIT" || fallback "release commit marker not available for v$version"
+  release_asset "v$version" "COMMIT" "$tmpdir/COMMIT" || fallback "release commit marker not available for v$version"
   release_commit=$(tr -d '[:space:]' < "$tmpdir/COMMIT" 2>/dev/null)
   if [ -z "$release_commit" ] || [ "$head_rev" != "$release_commit" ]; then
     fallback "checkout ($head_rev) is not the v$version release commit ($release_commit)"
   fi
 fi
 
-bin_url="$base_url/v$version/$asset"
-sums_url="$base_url/v$version/SHA256SUMS"
 tmpbin="$tmpdir/$asset"
 tmpsums="$tmpdir/SHA256SUMS"
 
-download "$bin_url" "$tmpbin" || fallback "prebuilt binary not available for v$version ($asset)"
-download "$sums_url" "$tmpsums" || fallback "checksums not available for v$version"
+release_asset "v$version" "$asset" "$tmpbin" || fallback "prebuilt binary not available for v$version ($asset)"
+release_asset "v$version" "SHA256SUMS" "$tmpsums" || fallback "checksums not available for v$version"
 
 expected=$(grep -E "^[0-9a-f]{64}  $asset\$" "$tmpsums" 2>/dev/null | awk '{print $1}' | head -n 1)
 [ -n "$expected" ] || fallback "no checksum listed for $asset"
