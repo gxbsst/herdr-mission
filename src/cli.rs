@@ -1818,7 +1818,9 @@ pub fn default_database() -> Option<PathBuf> {
 ///
 /// Herdr plugins must keep runtime state under `HERDR_PLUGIN_STATE_DIR`: the
 /// plugin root is a managed source checkout and must not hold durable state.
-/// Outside a plugin invocation, fall back to `~/.local/share/herdr-mission`.
+/// Outside a plugin invocation, fall back to the same state directory herdr
+/// derives from the plugin id, so standalone and plugin invocations share one
+/// database instead of splitting state across two files.
 fn database_path_for(
     state_dir: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
@@ -1826,7 +1828,18 @@ fn database_path_for(
     if let Some(dir) = state_dir.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(dir).join("missions.sqlite3"));
     }
-    home.map(|h| PathBuf::from(h).join(".local/share/herdr-mission/missions.sqlite3"))
+    let home = home?;
+    let state_root = std::env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&home).join(".local/state"));
+    Some(
+        state_root
+            .join("herdr")
+            .join("plugins")
+            .join("weston.herdr-mission")
+            .join("missions.sqlite3"),
+    )
 }
 
 fn malformed(reason: impl Into<String>) -> KernelError {
@@ -1964,7 +1977,7 @@ mod tests {
         assert_eq!(
             database_path_for(Some(OsStr::new("")), Some(home)),
             Some(PathBuf::from(
-                "/home/user/.local/share/herdr-mission/missions.sqlite3"
+                "/home/user/.local/state/herdr/plugins/weston.herdr-mission/missions.sqlite3"
             ))
         );
     }
@@ -1975,7 +1988,7 @@ mod tests {
         assert_eq!(
             database_path_for(None, Some(home)),
             Some(PathBuf::from(
-                "/home/user/.local/share/herdr-mission/missions.sqlite3"
+                "/home/user/.local/state/herdr/plugins/weston.herdr-mission/missions.sqlite3"
             ))
         );
     }

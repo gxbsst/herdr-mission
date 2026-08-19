@@ -17,4 +17,10 @@ if [[ -z "${TITLE:-}" ]]; then
   exit 0
 fi
 
-exec "$BIN" new --title="$TITLE"
+if [[ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]]; then
+  DB="$HERDR_PLUGIN_STATE_DIR/missions.sqlite3"
+else
+  DB="$HOME/.local/state/herdr/plugins/weston.herdr-mission/missions.sqlite3"
+fi
+
+exec "$BIN" new --title="$TITLE" --database="$DB"
