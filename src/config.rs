@@ -35,6 +35,25 @@ pub enum LaunchMode {
     Manual,
 }
 
+impl LaunchMode {
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Manual];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct LaunchSection {

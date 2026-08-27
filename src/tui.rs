@@ -22,9 +22,9 @@ use throbber_widgets_tui::{Throbber, ThrobberState};
 use crate::{
     bootstrap_database, create_mission, delete_mission, herdr_bin, kernel_deliver,
     kernel_dispatch_command, launch_mission, make_mission_id, read_mission_overviews, source_cwd,
-    workspace_close_argv, CreateMissionRequest, KernelError, LaunchConfig, LaunchOptions,
-    MissionLayout, MissionOverview, ProcessRunner, Provider, RoleOverview, SystemProcessRunner,
-    WorkspaceSource,
+    workspace_close_argv, CreateMissionRequest, KernelError, LaunchConfig, LaunchMode,
+    LaunchOptions, MissionLayout, MissionOverview, ProcessRunner, Provider, RoleOverview,
+    SystemProcessRunner, WorkspaceSource,
 };
 
 const TICK: Duration = Duration::from_secs(2);
@@ -41,6 +41,7 @@ enum Job {
         title: String,
         profile: Provider,
         roles: Vec<String>,
+        launch_mode: LaunchMode,
         workspace_source: WorkspaceSource,
         worktree_path: String,
     },
@@ -80,6 +81,7 @@ enum View {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormField {
     Layout,
+    LaunchMode,
     Workspace,
     WorktreePath,
     Profile,
@@ -99,10 +101,12 @@ struct App {
     input: String,
     send_role: usize,
     new_layout: MissionLayout,
+    new_launch_mode: LaunchMode,
     new_workspace_source: WorkspaceSource,
     new_worktree_path: String,
     new_profile: Provider,
     layout_cursor: usize,
+    launch_mode_cursor: usize,
     workspace_cursor: usize,
     profile_cursor: usize,
     new_field: FormField,
@@ -119,6 +123,11 @@ struct App {
 impl App {
     fn new(database: &Path) -> Result<Self, String> {
         let catalog = read_mission_overviews(database).map_err(|error| error_line(&error))?;
+        let config = LaunchConfig::load();
+        let launch_mode_cursor = LaunchMode::ALL
+            .iter()
+            .position(|mode| *mode == config.launch.launch_mode)
+            .unwrap_or(1);
         let mut app = Self {
             database: database.to_string_lossy().into_owned(),
             catalog,
@@ -131,10 +140,12 @@ impl App {
             input: String::new(),
             send_role: 1,
             new_layout: MissionLayout::Team,
+            new_launch_mode: config.launch.launch_mode,
             new_workspace_source: WorkspaceSource::Current,
             new_worktree_path: String::new(),
             new_profile: Provider::Codex,
             layout_cursor: 0,
+            launch_mode_cursor,
             workspace_cursor: 0,
             profile_cursor: 0,
             new_field: FormField::Layout,
@@ -332,6 +343,10 @@ impl App {
     fn move_option(&mut self, delta: isize) {
         match self.new_field {
             FormField::Layout => self.layout_cursor = move_index(self.layout_cursor, 2, delta),
+            FormField::LaunchMode => {
+                self.launch_mode_cursor =
+                    move_index(self.launch_mode_cursor, LaunchMode::ALL.len(), delta)
+            }
             FormField::Workspace => {
                 self.workspace_cursor = move_index(self.workspace_cursor, 3, delta)
             }
@@ -348,6 +363,7 @@ impl App {
     fn toggle_option(&mut self) {
         match self.new_field {
             FormField::Layout => self.new_layout = layout_at(self.layout_cursor),
+            FormField::LaunchMode => self.new_launch_mode = launch_mode_at(self.launch_mode_cursor),
             FormField::Workspace => {
                 self.new_workspace_source = workspace_source_at(self.workspace_cursor)
             }
@@ -513,6 +529,7 @@ impl App {
                 title: title.to_string(),
                 profile: self.new_profile,
                 roles,
+                launch_mode: self.new_launch_mode,
                 workspace_source: self.new_workspace_source,
                 worktree_path: self.new_worktree_path.trim().to_string(),
             },
@@ -773,8 +790,9 @@ impl App {
                 Span::styled(stage_label(&mission.stage), Style::default().fg(stage)),
                 Span::styled(
                     format!(
-                        "  ·  {}  ·  pending {}  ·  generation {}",
+                        "  ·  {}  ·  {}  ·  pending {}  ·  generation {}",
                         profile_short(&mission.agent_profile_id),
+                        mission.launch_mode.as_str(),
                         mission.pending_assignments,
                         mission.generation,
                     ),
@@ -838,6 +856,25 @@ impl App {
                 selected,
                 muted,
             ));
+        }
+
+        if self.new_layout == MissionLayout::Team {
+            lines.push(Line::from(Span::styled(
+                "▶ 启动模式",
+                focus(FormField::LaunchMode),
+            )));
+            for (idx, (mode, label)) in [
+                (LaunchMode::Auto, "Auto    立即启动全部角色"),
+                (LaunchMode::Manual, "Manual  仅启动 PM，其他角色按需"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let is_selected = *mode == self.new_launch_mode;
+                let is_cursor =
+                    self.new_field == FormField::LaunchMode && self.launch_mode_cursor == idx;
+                lines.push(option_line(label, is_selected, is_cursor, selected, muted));
+            }
         }
 
         lines.push(Line::from(Span::styled(
@@ -977,6 +1014,7 @@ fn form_field_cycle(layout: MissionLayout, source: WorkspaceSource) -> &'static 
     match (layout, source) {
         (MissionLayout::Team, WorkspaceSource::Import) => &[
             FormField::Layout,
+            FormField::LaunchMode,
             FormField::Workspace,
             FormField::WorktreePath,
             FormField::Profile,
@@ -992,6 +1030,7 @@ fn form_field_cycle(layout: MissionLayout, source: WorkspaceSource) -> &'static 
         ],
         (MissionLayout::Team, _) => &[
             FormField::Layout,
+            FormField::LaunchMode,
             FormField::Workspace,
             FormField::Profile,
             FormField::Roles,
@@ -1026,6 +1065,10 @@ fn move_index(index: usize, len: usize, delta: isize) -> usize {
 fn layout_at(index: usize) -> MissionLayout {
     const ALL: [MissionLayout; 2] = [MissionLayout::Team, MissionLayout::Simple];
     ALL[index % ALL.len()]
+}
+
+fn launch_mode_at(index: usize) -> LaunchMode {
+    LaunchMode::ALL[index % LaunchMode::ALL.len()]
 }
 
 fn profile_at(index: usize) -> Provider {
@@ -1230,10 +1273,8 @@ fn launch_options(
     LaunchOptions {
         direction: "right".into(),
         cwd: source_cwd(),
-        autonomy: "manual".into(),
         prompts_dir: None,
         tab_mode: LaunchConfig::load().launch.tab_mode,
-        launch_mode: LaunchConfig::load().launch.launch_mode,
         workspace_source,
         worktree_path,
     }
@@ -1262,18 +1303,11 @@ fn run_job(database: &str, job: Job) -> JobOutcome {
             title,
             profile,
             roles,
+            launch_mode,
             workspace_source,
             worktree_path,
         } => {
-            let roles: Vec<_> = roles.iter().map(|role| profile.role_config(role)).collect();
-            let request = CreateMissionRequest {
-                mission_id: make_mission_id(&title),
-                brief: title.clone(),
-                template: "general".into(),
-                agent_profile_id: profile.profile_id(),
-                agent_profile_version: profile.profile_version(),
-                roles,
-            };
+            let request = build_new_mission_request(&title, profile, &roles, launch_mode);
             match create_mission(path, &request) {
                 Ok(outcome) => {
                     let worktree_target = if worktree_path.is_empty() {
@@ -1344,6 +1378,23 @@ fn run_job(database: &str, job: Job) -> JobOutcome {
     JobOutcome { message }
 }
 
+fn build_new_mission_request(
+    title: &str,
+    profile: Provider,
+    roles: &[String],
+    launch_mode: LaunchMode,
+) -> CreateMissionRequest {
+    CreateMissionRequest {
+        mission_id: make_mission_id(title),
+        brief: title.to_string(),
+        template: "general".into(),
+        agent_profile_id: profile.profile_id(),
+        agent_profile_version: profile.profile_version(),
+        launch_mode,
+        roles: roles.iter().map(|role| profile.role_config(role)).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1365,6 +1416,7 @@ mod tests {
             mission_id: id.to_string(),
             brief: brief.to_string(),
             stage: stage.to_string(),
+            launch_mode: LaunchMode::Manual,
             created_at: "2026-08-15T00:00:00Z".to_string(),
             agent_profile_id: "codex-default-v1".to_string(),
             roles,
@@ -1386,10 +1438,12 @@ mod tests {
             input: String::new(),
             send_role: 1,
             new_layout: MissionLayout::Team,
+            new_launch_mode: LaunchMode::Manual,
             new_workspace_source: WorkspaceSource::Current,
             new_worktree_path: String::new(),
             new_profile: Provider::Codex,
             layout_cursor: 0,
+            launch_mode_cursor: 1,
             workspace_cursor: 0,
             profile_cursor: 0,
             new_field: FormField::Layout,
@@ -1478,6 +1532,14 @@ mod tests {
                 MissionLayout::Team,
                 WorkspaceSource::Current
             ),
+            FormField::LaunchMode
+        );
+        assert_eq!(
+            next_form_field(
+                FormField::LaunchMode,
+                MissionLayout::Team,
+                WorkspaceSource::Current
+            ),
             FormField::Workspace
         );
         assert_eq!(
@@ -1513,6 +1575,14 @@ mod tests {
             FormField::Layout
         );
         // Simple layout skips the Roles field.
+        assert_eq!(
+            next_form_field(
+                FormField::Layout,
+                MissionLayout::Simple,
+                WorkspaceSource::Current
+            ),
+            FormField::Workspace
+        );
         assert_eq!(
             next_form_field(
                 FormField::Workspace,
@@ -1552,6 +1622,8 @@ mod tests {
     fn form_option_indexes_and_cursor_wrap() {
         assert_eq!(layout_at(0), MissionLayout::Team);
         assert_eq!(layout_at(1), MissionLayout::Simple);
+        assert_eq!(launch_mode_at(0), LaunchMode::Auto);
+        assert_eq!(launch_mode_at(1), LaunchMode::Manual);
         assert_eq!(profile_at(0), Provider::Codex);
         assert_eq!(profile_at(1), Provider::Pi);
         assert_eq!(profile_at(Provider::ALL.len() - 1), Provider::Droid);
@@ -1560,5 +1632,29 @@ mod tests {
         assert_eq!(workspace_source_at(2), WorkspaceSource::Import);
         assert_eq!(move_index(0, 3, -1), 2);
         assert_eq!(move_index(2, 3, 1), 0);
+    }
+
+    #[test]
+    fn launch_mode_option_updates_the_single_mission_selection() {
+        let mut app = make_app(vec![], "");
+        app.new_field = FormField::LaunchMode;
+        app.launch_mode_cursor = 0;
+        app.toggle_option();
+        assert_eq!(app.new_launch_mode, LaunchMode::Auto);
+
+        app.launch_mode_cursor = 1;
+        app.toggle_option();
+        assert_eq!(app.new_launch_mode, LaunchMode::Manual);
+    }
+
+    #[test]
+    fn new_job_request_preserves_the_tui_launch_mode() {
+        let request = build_new_mission_request(
+            "Auto from TUI",
+            Provider::Codex,
+            &["pm".to_string(), "worker".to_string()],
+            LaunchMode::Auto,
+        );
+        assert_eq!(request.launch_mode, LaunchMode::Auto);
     }
 }

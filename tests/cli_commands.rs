@@ -109,6 +109,102 @@ fn new_creates_mission_with_four_roles() {
         .unwrap();
     assert_eq!(role_count, 4);
 
+    let launch_mode: String = connection
+        .query_row(
+            "SELECT launch_mode FROM mission_state WHERE mission_id = ?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(launch_mode, "manual");
+
+    cleanup(&path);
+}
+
+#[test]
+fn new_persists_auto_and_status_and_init_return_the_same_mode() {
+    let path = temp_db_path("new-auto-mode");
+    let created = Command::new(kernel_binary())
+        .args([
+            "new",
+            "--json",
+            "--no-start",
+            "--title=Persisted Auto",
+            "--launch-mode=auto",
+        ])
+        .arg(format!("--database={}", path.display()))
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let mission_id = created["mission_id"].as_str().unwrap();
+    assert_eq!(created["launch_mode"], "auto");
+
+    let status = Command::new(kernel_binary())
+        .args(["status", "--json"])
+        .arg(format!("--mission-id={mission_id}"))
+        .arg(format!("--database={}", path.display()))
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["launch_mode"], "auto");
+
+    let init = Command::new(kernel_binary())
+        .args(["init", "--json", "--role=pm"])
+        .arg(format!("--mission-id={mission_id}"))
+        .arg(format!("--database={}", path.display()))
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let init: Value = serde_json::from_slice(&init.stdout).unwrap();
+    assert_eq!(init["launch_mode"], "auto");
+
+    cleanup(&path);
+}
+
+#[test]
+fn set_launch_mode_switches_both_ways_and_rejects_unknown_values() {
+    let path = temp_db_path("set-launch-mode");
+    let created = Command::new(kernel_binary())
+        .args(["new", "--json", "--no-start", "--title=Switch Mode"])
+        .arg(format!("--database={}", path.display()))
+        .output()
+        .unwrap();
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let mission_id = created["mission_id"].as_str().unwrap();
+
+    for expected in ["auto", "manual"] {
+        let switched = Command::new(kernel_binary())
+            .args(["set-launch-mode", "--json"])
+            .arg(format!("--mission-id={mission_id}"))
+            .arg(format!("--launch-mode={expected}"))
+            .arg(format!("--database={}", path.display()))
+            .output()
+            .unwrap();
+        assert!(switched.status.success());
+        let switched: Value = serde_json::from_slice(&switched.stdout).unwrap();
+        assert_eq!(switched["launch_mode"], expected);
+    }
+
+    let invalid = Command::new(kernel_binary())
+        .args(["set-launch-mode", "--json", "--launch-mode=fast"])
+        .arg(format!("--mission-id={mission_id}"))
+        .arg(format!("--database={}", path.display()))
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(65));
+
+    let connection = Connection::open(&path).unwrap();
+    let persisted: String = connection
+        .query_row(
+            "SELECT launch_mode FROM mission_state WHERE mission_id = ?1",
+            [mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted, "manual");
+
     cleanup(&path);
 }
 

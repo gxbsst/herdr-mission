@@ -8,7 +8,7 @@ use std::{
 use herdr_mission::{
     create_mission, default_codex_team, kernel_deliver, kernel_dispatch_command,
     kernel_read_context, kernel_reply_command, read_role_context, CreateMissionRequest,
-    InspectQuery, MissionKernel, ProcessOutput, ProcessRunner,
+    InspectQuery, LaunchMode, MissionKernel, ProcessOutput, ProcessRunner,
 };
 use rusqlite::Connection;
 
@@ -33,6 +33,7 @@ fn request(mission_id: &str) -> CreateMissionRequest {
         template: "general".into(),
         agent_profile_id: "codex-default-v1".into(),
         agent_profile_version: 1,
+        launch_mode: LaunchMode::Manual,
         roles: default_codex_team(),
     }
 }

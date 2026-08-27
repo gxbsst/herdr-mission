@@ -17,12 +17,12 @@ use crate::{
     delete_mission, herdr_bin, is_valid_role_identity, kernel_deliver, kernel_dispatch_command,
     kernel_read_context, kernel_reply_command, launch_mission, list_missions, make_mission_id,
     manifest_path_for, open_writable, pane_rename_argv, read_generation, read_manifest,
-    read_mission_status, read_role_runtime, record_role_runtime, request_stop, resolve_mission_id,
-    resolve_roles, run_daemon, run_tui, source_cwd, start_role, utc_timestamp, verify_binary,
-    workspace_close_argv, write_manifest, CreateMissionRequest, ErrorCategory, KernelError,
-    LaunchConfig, LaunchMode, LaunchOptions, LaunchedRole, MissionLayout, ProcessRunner, Provider,
-    RoleOverride, SystemProcessRunner, WorkspaceSource, OWNER_IDENTITY, PROTOCOL_VERSION,
-    SCHEMA_VERSION,
+    read_mission_launch_mode, read_mission_status, read_role_runtime, record_role_runtime,
+    request_stop, resolve_mission_id, resolve_roles, run_daemon, run_tui, set_mission_launch_mode,
+    source_cwd, start_role, utc_timestamp, verify_binary, workspace_close_argv, write_manifest,
+    CreateMissionRequest, ErrorCategory, KernelError, LaunchConfig, LaunchMode, LaunchOptions,
+    LaunchedRole, MissionLayout, ProcessRunner, Provider, RoleOverride, SystemProcessRunner,
+    WorkspaceSource, OWNER_IDENTITY, PROTOCOL_VERSION, SCHEMA_VERSION,
 };
 
 /// Exit code for an unknown subcommand (distinct from malformed input).
@@ -40,6 +40,7 @@ pub fn run(args: &[String]) -> i32 {
         Some("doctor") => run_doctor(iter),
         Some("new") => run_new(iter),
         Some("status") => run_status(iter),
+        Some("set-launch-mode") => run_set_launch_mode(iter),
         Some("list") => run_list(iter),
         Some("init") => run_init(iter),
         Some("send") => run_send(iter),
@@ -71,6 +72,7 @@ fn print_usage() -> i32 {
            new         创建 Mission\n\
            list        列出所有 Mission\n\
            status      查看单个 Mission 状态\n\
+           set-launch-mode  切换 Mission 的 Auto/Manual 模式\n\
            init        读取角色待办与收件箱\n\
            send        派发 Assignment 给目标角色\n\
            reply       回执 Assignment\n\
@@ -105,7 +107,7 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
     let mut json_mode = false;
     let mut request_id: Option<String> = None;
     let mut prompts_dir: Option<PathBuf> = None;
-    let mut autonomy = "manual".to_string();
+    let mut legacy_autonomy: Option<LaunchMode> = None;
     let mut launch_mode: Option<LaunchMode> = None;
     let mut role_overrides: Vec<RoleOverride> = Vec::new();
 
@@ -163,18 +165,25 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                 None => workspace_source = WorkspaceSource::Current,
             },
             "--prompts-dir" => prompts_dir = value.map(PathBuf::from),
-            "--autonomy" => autonomy = value.unwrap_or_else(|| "manual".into()),
-            "--launch-mode" => match value.as_deref() {
-                Some("auto") => launch_mode = Some(LaunchMode::Auto),
-                Some("manual") => launch_mode = Some(LaunchMode::Manual),
-                Some(other) => {
+            "--autonomy" => match value.as_deref().and_then(LaunchMode::parse) {
+                Some(mode) => legacy_autonomy = Some(mode),
+                None => {
                     return cli_fail(
                         json_mode,
-                        malformed(format!("unknown --launch-mode: {other}")),
+                        malformed("--autonomy only accepts auto or manual"),
                         EXIT_MALFORMED_ARGS,
                     );
                 }
-                None => launch_mode = None,
+            },
+            "--launch-mode" => match value.as_deref().and_then(LaunchMode::parse) {
+                Some(mode) => launch_mode = Some(mode),
+                None => {
+                    return cli_fail(
+                        json_mode,
+                        malformed("--launch-mode only accepts auto or manual"),
+                        EXIT_MALFORMED_ARGS,
+                    );
+                }
             },
             "--role" => match value {
                 Some(spec) => match parse_role_spec(&spec) {
@@ -236,12 +245,15 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
         },
     };
 
+    let config = LaunchConfig::load();
+    let launch_mode = resolve_launch_mode(launch_mode.or(legacy_autonomy), &config);
     let request = CreateMissionRequest {
         mission_id: make_mission_id(&title),
         brief: title.clone(),
         template: "general".into(),
         agent_profile_id: provider.profile_id(),
         agent_profile_version: provider.profile_version(),
+        launch_mode,
         roles,
     };
     match create_mission(&database, &request) {
@@ -253,14 +265,11 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
 
             if !no_start {
                 let cwd = source_cwd();
-                let config = LaunchConfig::load();
                 let options = LaunchOptions {
                     direction: "right".into(),
                     cwd,
-                    autonomy,
                     prompts_dir,
                     tab_mode: config.launch.tab_mode,
-                    launch_mode: resolve_launch_mode(launch_mode, &config),
                     workspace_source,
                     worktree_path: None,
                 };
@@ -313,6 +322,7 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                         "database": database,
                         "request_id": request_id,
                         "provider": provider.agent_kind(),
+                        "launch_mode": launch_mode.as_str(),
                         "roles": launched.iter().map(|role| json!({
                             "role": role.role.clone(),
                             "agent_name": role.agent_name.clone(),
@@ -324,6 +334,7 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
             } else {
                 println!("Mission《{title}》 (id={mission_id})");
                 println!("  provider: {}", provider.agent_kind());
+                println!("  launch mode: {}", launch_mode.as_str());
                 println!("  database: {}", database.display());
                 for role in &launched {
                     println!(
@@ -526,6 +537,7 @@ fn run_status<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                 "status": "ok",
                 "mission_id": status.mission_id,
                 "stage": status.stage,
+                "launch_mode": status.launch_mode.as_str(),
                 "roles": status.roles,
                 "pending_assignments": status.pending_assignments,
                 "generation": status.generation,
@@ -540,9 +552,102 @@ fn run_status<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                     "mission {} stage={} pending={} generation={}",
                     status.mission_id, status.stage, status.pending_assignments, status.generation
                 );
+                println!("  launch mode: {}", status.launch_mode.as_str());
                 for (role, health) in &status.roles {
                     println!("  {role}: {health}");
                 }
+            }
+            0
+        }
+        Err(error) => cli_fail(json_mode, error, 1),
+    }
+}
+
+fn run_set_launch_mode<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
+    let mut mission_id: Option<String> = None;
+    let mut database: Option<PathBuf> = None;
+    let mut launch_mode: Option<LaunchMode> = None;
+    let mut json_mode = false;
+
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        let (key, inline) = match arg.split_once('=') {
+            Some((key, value)) => (key, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        if key == "--json" {
+            json_mode = true;
+            continue;
+        }
+        let value = inline.or_else(|| args.next().cloned());
+        match key {
+            "--mission-id" | "--mission" => mission_id = value,
+            "--database" => database = value.map(PathBuf::from),
+            "--launch-mode" => match value.as_deref().and_then(LaunchMode::parse) {
+                Some(mode) => launch_mode = Some(mode),
+                None => {
+                    return cli_fail(
+                        json_mode,
+                        malformed("--launch-mode only accepts auto or manual"),
+                        EXIT_MALFORMED_ARGS,
+                    );
+                }
+            },
+            "--help" | "-h" => {
+                return command_help(
+                    "set-launch-mode",
+                    "--mission-id <id> --launch-mode <auto|manual> [--database <path>] [--json]",
+                );
+            }
+            other => {
+                return cli_fail(
+                    json_mode,
+                    malformed(format!("unexpected argument: {other}")),
+                    EXIT_MALFORMED_ARGS,
+                );
+            }
+        }
+    }
+
+    let mission_id = match required_string(mission_id, "--mission-id") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(json_mode, error, EXIT_MALFORMED_ARGS),
+    };
+    let launch_mode = match launch_mode {
+        Some(value) => value,
+        None => {
+            return cli_fail(
+                json_mode,
+                malformed("--launch-mode is required"),
+                EXIT_MALFORMED_ARGS,
+            );
+        }
+    };
+    let database = match database.or_else(default_database) {
+        Some(path) => path,
+        None => {
+            return cli_fail(
+                json_mode,
+                malformed("cannot resolve a state directory or HOME for default database path"),
+                EXIT_MALFORMED_ARGS,
+            );
+        }
+    };
+
+    match set_mission_launch_mode(&database, &mission_id, launch_mode) {
+        Ok(()) => {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "status": "ok",
+                        "mission_id": mission_id,
+                        "launch_mode": launch_mode.as_str(),
+                    }))
+                    .expect("set launch mode outcome must serialize")
+                );
+            } else {
+                println!("{mission_id} launch mode -> {}", launch_mode.as_str());
             }
             0
         }
@@ -623,6 +728,10 @@ fn run_init<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
 
     match kernel_read_context(&database, &mission_id, &role) {
         Ok(context) => {
+            let launch_mode = match read_mission_launch_mode(&database, &mission_id) {
+                Ok(mode) => mode,
+                Err(error) => return cli_fail(json_mode, error, 1),
+            };
             if json_mode {
                 println!(
                     "{}",
@@ -633,6 +742,7 @@ fn run_init<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                         "role": context.role,
                         "health": context.health,
                         "generation": context.generation,
+                        "launch_mode": launch_mode.as_str(),
                         "pending_assignments": context.pending_assignments.iter().map(|a| json!({
                             "id": a.id.clone(),
                             "source": a.source.clone(),
@@ -658,6 +768,7 @@ fn run_init<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                     context.health,
                     context.pending_assignments.len()
                 );
+                println!("launch mode: {}", launch_mode.as_str());
                 for assignment in &context.pending_assignments {
                     println!(
                         "  - {} {} ({})",
@@ -1134,10 +1245,8 @@ fn run_resume<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
     let options = LaunchOptions {
         direction: "right".into(),
         cwd,
-        autonomy: "manual".into(),
         prompts_dir: None,
         tab_mode: LaunchConfig::load().launch.tab_mode,
-        launch_mode: LaunchConfig::load().launch.launch_mode,
         workspace_source: WorkspaceSource::Current,
         worktree_path: None,
     };
@@ -1265,7 +1374,6 @@ fn run_start_role<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
         &role,
         &pm_pane_id,
         &cwd,
-        "manual",
         None,
         &runner,
         &herdr_bin(),

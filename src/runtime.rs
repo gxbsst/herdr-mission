@@ -14,19 +14,20 @@ use std::{
     time::Duration,
 };
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::{
     agent_name_token, agent_rename_argv, agent_start_args, git_head, git_root, pane_get_argv,
     pane_list_argv, pane_move_to_tab_argv, pane_rename_argv, pane_run_argv, pane_split_in_argv,
     parse_pane_get, parse_pane_list, parse_pane_split, parse_tab_create, parse_tab_get,
     parse_tab_list, parse_workspace_create, parse_worktree_create, primary_worktree,
-    read_mission_title, read_role_runtime, read_workspace, record_role_pane, record_role_runtime,
-    role_init_prompt, set_mission_stage, slugify, tab_create_argv, tab_get_argv, tab_list_argv,
-    tab_rename_argv, upsert_workspace, workspace_create_argv, workspace_label,
-    worktree_create_argv, worktree_open_argv, ErrorCategory, KernelError, LaunchConfig, LaunchMode,
-    MissionWorkspace, PaneInfo, ProcessOutput, ProcessRunner, RoleRuntimeRow, TabCreated, TabMode,
-    WorkspaceSource, REVIEW_REGION_NAME, VERIFICATION_REGION_NAME, WORK_REGION_NAME,
+    read_mission_launch_mode, read_mission_title, read_role_runtime, read_workspace,
+    record_role_pane, record_role_runtime, role_init_prompt, set_mission_stage, slugify,
+    tab_create_argv, tab_get_argv, tab_list_argv, tab_rename_argv, upsert_workspace,
+    workspace_create_argv, workspace_label, worktree_create_argv, worktree_open_argv,
+    ErrorCategory, KernelError, LaunchConfig, LaunchMode, MissionWorkspace, PaneInfo,
+    ProcessOutput, ProcessRunner, RoleRuntimeRow, TabCreated, TabMode, WorkspaceSource,
+    REVIEW_REGION_NAME, VERIFICATION_REGION_NAME, WORK_REGION_NAME,
 };
 
 /// How many times to poll or re-attempt after delayed Agent/shell readiness.
@@ -38,10 +39,8 @@ const AGENT_START_RETRY_DELAY: Duration = Duration::from_millis(250);
 pub struct LaunchOptions {
     pub direction: String,
     pub cwd: String,
-    pub autonomy: String,
     pub prompts_dir: Option<PathBuf>,
     pub tab_mode: TabMode,
-    pub launch_mode: LaunchMode,
     pub workspace_source: WorkspaceSource,
     pub worktree_path: Option<String>,
 }
@@ -51,10 +50,8 @@ impl Default for LaunchOptions {
         Self {
             direction: "right".into(),
             cwd: ".".into(),
-            autonomy: "manual".into(),
             prompts_dir: None,
             tab_mode: TabMode::Lanes,
-            launch_mode: LaunchMode::Manual,
             workspace_source: WorkspaceSource::Current,
             worktree_path: None,
         }
@@ -89,6 +86,7 @@ pub fn launch_mission(
     progress: &mut dyn FnMut(&str),
 ) -> Result<LaunchOutcome, KernelError> {
     let roles = read_role_runtime(database, mission_id)?;
+    let launch_mode = read_mission_launch_mode(database, mission_id)?;
     let title = read_mission_title(database, mission_id)?;
     let is_simple = roles.len() == 1 && roles[0].role == "worker";
     let mut workspace = ensure_mission_workspace(
@@ -119,7 +117,7 @@ pub fn launch_mission(
             progress(&format!("跳过已启动的 {role}", role = row.role));
             continue;
         }
-        if !is_simple && options.launch_mode == LaunchMode::Manual && row.role != "pm" {
+        if !is_simple && launch_mode == LaunchMode::Manual && row.role != "pm" {
             progress(&format!(
                 "manual 模式：跳过 {role}（等待 PM 按需启动）",
                 role = row.role
@@ -169,7 +167,7 @@ pub fn launch_mission(
             mission_id,
             &row.role,
             &role_cwd,
-            &options.autonomy,
+            launch_mode.as_str(),
             &database_str,
             &bin,
             options.prompts_dir.as_deref(),
@@ -268,7 +266,6 @@ pub fn start_role(
     role: &str,
     anchor_pane_id: &str,
     cwd: &str,
-    autonomy: &str,
     prompts_dir: Option<&Path>,
     runner: &dyn ProcessRunner,
     herdr: &str,
@@ -285,6 +282,7 @@ pub fn start_role(
     }
 
     let title = read_mission_title(database, mission_id)?;
+    let launch_mode = read_mission_launch_mode(database, mission_id)?;
     let token = agent_name_token(mission_id);
     let agent_name = format!("mission-{token}-{role}");
     let workspace = read_workspace(database, mission_id)?.ok_or_else(|| {
@@ -339,7 +337,7 @@ pub fn start_role(
         mission_id,
         role,
         &role_cwd,
-        autonomy,
+        launch_mode.as_str(),
         &database_str,
         &bin,
         prompts_dir,
@@ -802,10 +800,7 @@ fn reconcile_completed_role(
     workspace: &MissionWorkspace,
     cwd: &str,
 ) -> Result<(), KernelError> {
-    let output = run(runner, herdr, &pane_get_argv(&row.pane_id))?;
-    if output.exit_code != 0 {
-        return Err(launch_failed("pane get", &output));
-    }
+    let output = get_pane_with_visibility_retry(runner, herdr, &row.pane_id)?;
     let actual = parse_pane_get(&output.stdout)?;
     let expected = AgentRecoveryTarget {
         pane_id: &row.pane_id,
@@ -920,10 +915,7 @@ fn validate_work_region_pane(
         retryable: false,
         details: BTreeMap::from([("operation".into(), json!("work region validation"))]),
     })?;
-    let output = run(runner, herdr, &pane_get_argv(pane_id))?;
-    if output.exit_code != 0 {
-        return Err(launch_failed("pane get", &output));
-    }
+    let output = get_pane_with_visibility_retry(runner, herdr, pane_id)?;
     let pane = parse_pane_get(&output.stdout)?;
     if pane.pane_id != pane_id
         || pane.workspace_id != workspace.workspace_id
@@ -1102,10 +1094,7 @@ fn adopt_running_agent(
     herdr: &str,
     expected: &AgentRecoveryTarget<'_>,
 ) -> Result<AgentAdoption, KernelError> {
-    let output = run(runner, herdr, &pane_get_argv(expected.pane_id))?;
-    if output.exit_code != 0 {
-        return Err(launch_failed("pane get", &output));
-    }
+    let output = get_pane_with_visibility_retry(runner, herdr, expected.pane_id)?;
     let actual = parse_pane_get(&output.stdout)
         .map_err(|error| recovery_rejected(expected, None, error.message))?;
 
@@ -1184,6 +1173,41 @@ fn adopt_running_agent(
 
 fn is_agent_pane_busy(output: &ProcessOutput) -> bool {
     output.stderr.contains("agent_pane_busy") || output.stdout.contains("agent_pane_busy")
+}
+
+fn get_pane_with_visibility_retry(
+    runner: &dyn ProcessRunner,
+    herdr: &str,
+    pane_id: &str,
+) -> Result<ProcessOutput, KernelError> {
+    for poll in 0..=AGENT_RECOVERY_POLLS {
+        let output = run(runner, herdr, &pane_get_argv(pane_id))?;
+        if output.exit_code == 0 {
+            return Ok(output);
+        }
+        if is_pane_not_found(&output) && poll < AGENT_RECOVERY_POLLS {
+            std::thread::sleep(AGENT_START_RETRY_DELAY);
+            continue;
+        }
+        return Err(launch_failed("pane get", &output));
+    }
+    unreachable!("bounded pane visibility loop always returns")
+}
+
+fn is_pane_not_found(output: &ProcessOutput) -> bool {
+    [&output.stderr, &output.stdout].into_iter().any(|text| {
+        serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("pane_not_found")
+    })
 }
 
 fn is_agent_start_timeout(output: &ProcessOutput) -> bool {
@@ -1318,5 +1342,29 @@ fn mission_bin() -> String {
     match std::env::current_exe() {
         Ok(path) => path.to_string_lossy().into_owned(),
         Err(_) => "herdr-mission".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_not_found_requires_the_exact_structured_error_code() {
+        let exact = ProcessOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: r#"{"error":{"code":"pane_not_found","message":"not visible yet"}}"#
+                .to_string(),
+        };
+        assert!(is_pane_not_found(&exact));
+
+        let unrelated = ProcessOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: r#"{"error":{"code":"transport_failed","message":"pane_not_found upstream"}}"#
+                .to_string(),
+        };
+        assert!(!is_pane_not_found(&unrelated));
     }
 }

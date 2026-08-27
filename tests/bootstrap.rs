@@ -75,6 +75,53 @@ fn bootstrap_is_idempotent_and_does_not_reset_generation() {
 }
 
 #[test]
+fn bootstrap_migrates_legacy_mission_state_with_manual_launch_mode() {
+    let path = temp_db_path("legacy-mission-state");
+    bootstrap_database(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             ALTER TABLE mission_state RENAME TO mission_state_current;
+             CREATE TABLE mission_state (
+                 mission_id TEXT PRIMARY KEY,
+                 stage TEXT NOT NULL DEFAULT 'preparing',
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO mission_state(mission_id, stage, updated_at)
+             VALUES('msn-legacy', 'active', '2026-08-27T00:00:00Z');
+             DROP TABLE mission_state_current;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+    drop(connection);
+
+    bootstrap_database(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let launch_mode: String = connection
+        .query_row(
+            "SELECT launch_mode FROM mission_state WHERE mission_id = 'msn-legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(launch_mode, "manual");
+
+    bootstrap_database(&path).unwrap();
+    let column_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('mission_state') WHERE name = 'launch_mode'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(column_count, 1);
+
+    cleanup(&path);
+}
+
+#[test]
 fn open_writable_accepts_matching_owner_and_reads_generation() {
     let path = temp_db_path("owner-ok");
     bootstrap_database(&path).unwrap();

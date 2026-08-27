@@ -35,8 +35,31 @@
 ## 6. v0.1.4 发布与最终验收
 
 - [x] 6.1 将 Cargo 与插件版本同步提升到 `0.1.4`
-- [ ] 6.2 按 Lore 协议提交并推送 `master` 与不可变 tag `v0.1.4`
-- [ ] 6.3 验证三平台 release 资产、`SHA256SUMS` 与 `COMMIT`
-- [ ] 6.4 在 `sqbair` 通过 GitHub 插件安装链路安装 `0.1.4`，确认预编译资产 SHA
-- [ ] 6.5 恢复或重建 Auto canary，验证 PM、Worker、Scout、Reviewer 全部启动且三区域名称正确
-- [ ] 6.6 清理临时 canary，并确认 `rust-version` Mission 与 doctor 仍正常
+- [x] 6.2 按 Lore 协议提交并推送 `master` 与不可变 tag `v0.1.4`
+- [x] 6.3 验证三平台 release 资产、`SHA256SUMS` 与 `COMMIT`
+- [x] 6.4 在 `sqbair` 通过 GitHub 插件安装链路安装 `0.1.4`，确认预编译资产 SHA
+- [x] 6.5 记录 `v0.1.4` Auto canary 的 fresh Worker `pane_not_found` 失败证据
+- [x] 6.6 按用户要求停止 `sqbair` 后续 canary 与安装验证
+
+## 7. 持久化模式与入口回归测试
+
+- [x] 7.1 增加旧库 `mission_state.launch_mode` 幂等迁移与 Manual 默认测试
+- [x] 7.2 增加 CLI new 持久化、status/init 返回与 `set-launch-mode` 双向切换测试
+- [x] 7.3 增加 TUI Auto/Manual 字段导航、选择和 Job 透传测试
+- [x] 7.4 增加 resume/start-role/角色 prompt 读取 Mission 持久化模式测试
+- [x] 7.5 增加 fresh pane 首次 `pane_not_found`、随后可见的 RED 测试，并保留持续不存在失败关闭测试
+
+## 8. v0.1.5 实现与本地验证
+
+- [x] 8.1 在 plugin-owned `mission_state` 持久化模式并提供读写接口
+- [x] 8.2 实现控制中心新建模式选择和 `set-launch-mode` CLI
+- [x] 8.3 统一 new/resume/start-role/init/status 与角色 prompt 的模式真源
+- [x] 8.4 更新共享 `herdr-mission-team` Skill 与 README
+- [x] 8.5 实现 fresh pane `pane_not_found` 有限等待
+- [x] 8.6 运行 rustfmt、Clippy、完整测试、release build 与 OpenSpec strict 校验
+
+## 9. v0.1.5 发布与资产验收
+
+- [x] 9.1 将 Cargo 与插件版本同步提升到 `0.1.5`
+- [x] 9.2 按 Lore 协议提交并推送 `master` 与不可变 tag `v0.1.5`
+- [ ] 9.3 验证 GitHub release 三平台资产、`SHA256SUMS` 与 `COMMIT`

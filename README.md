@@ -48,6 +48,7 @@ git push origin vX.Y.Z
 new         创建 Mission
 list        列出所有 Mission
 status      查看单个 Mission 状态
+set-launch-mode  切换 Mission 的 Auto/Manual 模式
 init        读取角色待办与收件箱
 send        派发 Assignment 给目标角色
 reply       回执 Assignment
@@ -79,6 +80,10 @@ Team Mission 支持两种角色启动模式：
 herdr-mission new --title "任务名" --launch-mode auto
 ```
 
+控制中心的 Team Mission 新建表单也有 Auto/Manual 选择。最终模式会写入 Mission
+状态；之后 `status`、`init`、`resume`、`start-role` 和新生成的角色 prompt 都以这个
+持久化值为准，不会因全局配置变化而改变。
+
 全局默认值配置在 `~/.config/herdr-mission/config.toml`：
 
 ```toml
@@ -88,6 +93,21 @@ launch_mode = "auto"
 
 优先级为：当前命令的 `--launch-mode` > 全局配置 > 内置 `manual`。配置文件
 缺失、无法读取或内容无效时会安全回退为 `manual`。
+
+已有 Mission 可以显式切换策略：
+
+```sh
+herdr-mission set-launch-mode \
+  --mission-id <mission-id> \
+  --launch-mode auto
+```
+
+该命令只更新模式，不会隐式创建或关闭 pane。切换为 Auto 后如需立即补启动尚未运行
+的角色，再显式执行：
+
+```sh
+herdr-mission resume --mission-id <mission-id>
+```
 
 ## 结构
 

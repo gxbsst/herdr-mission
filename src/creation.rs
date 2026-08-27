@@ -16,7 +16,8 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
 use crate::{
-    bootstrap_database, open_writable, read_generation, ErrorCategory, KernelError, OWNER_IDENTITY,
+    bootstrap_database, open_writable, read_generation, ErrorCategory, KernelError, LaunchMode,
+    OWNER_IDENTITY,
 };
 
 pub const TEAM_ROLES: [&str; 4] = ["pm", "worker", "scout", "reviewer"];
@@ -257,6 +258,7 @@ pub struct CreateMissionRequest {
     pub template: String,
     pub agent_profile_id: String,
     pub agent_profile_version: i64,
+    pub launch_mode: LaunchMode,
     pub roles: Vec<RoleConfig>,
 }
 
@@ -270,6 +272,7 @@ pub struct CreateMissionOutcome {
 pub struct MissionStatus {
     pub mission_id: String,
     pub stage: String,
+    pub launch_mode: LaunchMode,
     pub roles: BTreeMap<String, String>,
     pub pending_assignments: i64,
     pub generation: i64,
@@ -306,6 +309,7 @@ pub struct MissionOverview {
     pub mission_id: String,
     pub brief: String,
     pub stage: String,
+    pub launch_mode: LaunchMode,
     pub created_at: String,
     pub agent_profile_id: String,
     pub roles: Vec<RoleOverview>,
@@ -471,10 +475,10 @@ pub fn create_mission(
 
     transaction
         .execute(
-            "INSERT INTO mission_state(mission_id, stage, updated_at)
-             VALUES(?1, 'preparing', ?2)
+            "INSERT INTO mission_state(mission_id, stage, launch_mode, updated_at)
+             VALUES(?1, 'preparing', ?2, ?3)
              ON CONFLICT(mission_id) DO NOTHING",
-            params![request.mission_id, now],
+            params![request.mission_id, request.launch_mode.as_str(), now],
         )
         .map_err(|error| {
             sqlite_error("sqlite_state_write_failed", "insert_mission_state", error)
@@ -532,6 +536,75 @@ pub fn read_mission_state(
         .map_err(|error| sqlite_error("sqlite_state_read_failed", "read_mission_state", error))
 }
 
+pub fn read_mission_launch_mode(
+    database: &Path,
+    mission_id: &str,
+) -> Result<LaunchMode, KernelError> {
+    let connection = open_writable(database, OWNER_IDENTITY)?;
+    let value = connection
+        .query_row(
+            "SELECT launch_mode FROM mission_state WHERE mission_id = ?1",
+            [mission_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_state_read_failed",
+                "read_mission_launch_mode",
+                error,
+            )
+        })?
+        .ok_or_else(|| mission_not_found(mission_id))?;
+    LaunchMode::parse(&value).ok_or_else(|| KernelError {
+        category: ErrorCategory::Contract,
+        code: "invalid_launch_mode".into(),
+        message: "Mission launch mode is invalid".into(),
+        retryable: false,
+        details: BTreeMap::from([
+            ("mission_id".into(), json!(mission_id)),
+            ("launch_mode".into(), json!(value)),
+        ]),
+    })
+}
+
+pub fn set_mission_launch_mode(
+    database: &Path,
+    mission_id: &str,
+    launch_mode: LaunchMode,
+) -> Result<(), KernelError> {
+    bootstrap_database(database)?;
+    let connection = open_writable(database, OWNER_IDENTITY)?;
+    let updated = connection
+        .execute(
+            "UPDATE mission_state
+             SET launch_mode = ?1, updated_at = ?2
+             WHERE mission_id = ?3",
+            params![launch_mode.as_str(), utc_timestamp(), mission_id],
+        )
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_state_write_failed",
+                "set_mission_launch_mode",
+                error,
+            )
+        })?;
+    if updated == 0 {
+        return Err(mission_not_found(mission_id));
+    }
+    Ok(())
+}
+
+fn mission_not_found(mission_id: &str) -> KernelError {
+    KernelError {
+        category: ErrorCategory::Domain,
+        code: "mission_not_found".into(),
+        message: "Mission is not present in the Rust-owned database".into(),
+        retryable: false,
+        details: BTreeMap::from([("mission_id".into(), json!(mission_id))]),
+    }
+}
+
 /// Read the Mission title (the `brief` column) used for role prompts and
 /// human-readable output.
 pub fn read_mission_title(database: &Path, mission_id: &str) -> Result<String, KernelError> {
@@ -578,15 +651,22 @@ pub fn read_mission_status(
         });
     }
 
-    let stage = connection
+    let (stage, launch_mode) = connection
         .query_row(
-            "SELECT stage FROM mission_state WHERE mission_id = ?1",
+            "SELECT stage, launch_mode FROM mission_state WHERE mission_id = ?1",
             [mission_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(|error| sqlite_error("sqlite_status_read_failed", "stage", error))?
-        .unwrap_or_else(|| "preparing".to_string());
+        .unwrap_or_else(|| ("preparing".to_string(), "manual".to_string()));
+    let launch_mode = LaunchMode::parse(&launch_mode).ok_or_else(|| KernelError {
+        category: ErrorCategory::Contract,
+        code: "invalid_launch_mode".into(),
+        message: "Mission launch mode is invalid".into(),
+        retryable: false,
+        details: BTreeMap::from([("mission_id".into(), json!(mission_id))]),
+    })?;
 
     let mut statement = connection
         .prepare("SELECT role, health FROM team_roles WHERE mission_id = ?1 ORDER BY role")
@@ -612,6 +692,7 @@ pub fn read_mission_status(
     Ok(MissionStatus {
         mission_id: mission_id.to_string(),
         stage,
+        launch_mode,
         roles,
         pending_assignments,
         generation,
@@ -763,7 +844,7 @@ pub fn read_mission_overviews(database: &Path) -> Result<Vec<MissionOverview>, K
     let mut mission_statement = connection
         .prepare(
             "SELECT m.mission_id, m.brief, COALESCE(s.stage, 'preparing'),
-                    m.created_at, m.agent_profile_id
+                    COALESCE(s.launch_mode, 'manual'), m.created_at, m.agent_profile_id
              FROM team_missions m
              LEFT JOIN mission_state s ON s.mission_id = m.mission_id
              ORDER BY m.created_at DESC, m.mission_id",
@@ -777,6 +858,7 @@ pub fn read_mission_overviews(database: &Path) -> Result<Vec<MissionOverview>, K
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })
         .map_err(|error| sqlite_error("sqlite_status_read_failed", "overviews", error))?
@@ -838,14 +920,22 @@ pub fn read_mission_overviews(database: &Path) -> Result<Vec<MissionOverview>, K
     }
 
     let mut overviews = Vec::with_capacity(mission_rows.len());
-    for (mission_id, brief, stage, created_at, agent_profile_id) in mission_rows {
+    for (mission_id, brief, stage, launch_mode, created_at, agent_profile_id) in mission_rows {
         let mut roles = roles_by_mission.remove(&mission_id).unwrap_or_default();
         roles.sort_by_key(|role| team_role_order(&role.role));
         let pending_assignments = pending_by_mission.get(&mission_id).copied().unwrap_or(0);
+        let launch_mode = LaunchMode::parse(&launch_mode).ok_or_else(|| KernelError {
+            category: ErrorCategory::Contract,
+            code: "invalid_launch_mode".into(),
+            message: "Mission launch mode is invalid".into(),
+            retryable: false,
+            details: BTreeMap::from([("mission_id".into(), json!(mission_id))]),
+        })?;
         overviews.push(MissionOverview {
             mission_id,
             brief,
             stage,
+            launch_mode,
             created_at,
             agent_profile_id,
             roles,

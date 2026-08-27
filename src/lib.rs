@@ -41,13 +41,14 @@ pub use coordination::{
 };
 pub use creation::{
     agent_name_token, create_mission, default_codex_team, delete_mission, is_valid_role_identity,
-    list_missions, make_mission_id, parse_role_ref, pi_quality_team, read_mission_overviews,
-    read_mission_state, read_mission_status, read_mission_title, read_role_runtime,
-    record_role_pane, record_role_runtime, resolve_mission_id, resolve_roles, role_kind,
-    set_mission_stage, slugify, utc_timestamp, CreateMissionOutcome, CreateMissionRequest,
-    DeleteMissionOutcome, MissionLayout, MissionOverview, MissionStatus, MissionSummary, Provider,
-    RoleConfig, RoleOverride, RoleOverview, RoleRuntimeRow, DEFAULT_AGENT_PROFILE_ID,
-    DEFAULT_AGENT_PROFILE_VERSION, PI_QUALITY_PROFILE_ID, TEAM_ROLES,
+    list_missions, make_mission_id, parse_role_ref, pi_quality_team, read_mission_launch_mode,
+    read_mission_overviews, read_mission_state, read_mission_status, read_mission_title,
+    read_role_runtime, record_role_pane, record_role_runtime, resolve_mission_id, resolve_roles,
+    role_kind, set_mission_launch_mode, set_mission_stage, slugify, utc_timestamp,
+    CreateMissionOutcome, CreateMissionRequest, DeleteMissionOutcome, MissionLayout,
+    MissionOverview, MissionStatus, MissionSummary, Provider, RoleConfig, RoleOverride,
+    RoleOverview, RoleRuntimeRow, DEFAULT_AGENT_PROFILE_ID, DEFAULT_AGENT_PROFILE_VERSION,
+    PI_QUALITY_PROFILE_ID, TEAM_ROLES,
 };
 pub use daemon::{request_stop, run_daemon, DaemonLock};
 pub use domain::{EffectExecutor, MissionKernel};

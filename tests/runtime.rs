@@ -38,6 +38,9 @@ struct FakeRunner {
     pane_tabs: RefCell<BTreeMap<String, String>>,
     missing_session_polls: Cell<u32>,
     remaining_agent_start_failures: Cell<Option<u32>>,
+    agent_start_failure_pane: Option<&'static str>,
+    pane_not_found_pane: Option<&'static str>,
+    remaining_pane_not_found: Cell<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +72,9 @@ impl FakeRunner {
             pane_tabs: RefCell::new(BTreeMap::new()),
             missing_session_polls: Cell::new(0),
             remaining_agent_start_failures: Cell::new(None),
+            agent_start_failure_pane: None,
+            pane_not_found_pane: None,
+            remaining_pane_not_found: Cell::new(0),
         }
     }
 
@@ -96,6 +102,17 @@ impl FakeRunner {
 
     fn with_agent_start_failures(self, failures: u32) -> Self {
         self.remaining_agent_start_failures.set(Some(failures));
+        self
+    }
+
+    fn with_agent_start_failure_pane(mut self, pane_id: &'static str) -> Self {
+        self.agent_start_failure_pane = Some(pane_id);
+        self
+    }
+
+    fn with_transient_pane_not_found(mut self, pane_id: &'static str, polls: u32) -> Self {
+        self.pane_not_found_pane = Some(pane_id);
+        self.remaining_pane_not_found.set(polls);
         self
     }
 
@@ -276,6 +293,17 @@ impl ProcessRunner for FakeRunner {
             Some("pane") if args.get(1).map(String::as_str) == Some("get") => {
                 let state = self.pane_state();
                 let pane_id = args.get(2).map(String::as_str).unwrap_or("w6J:p0");
+                let pane_not_found = self.remaining_pane_not_found.get();
+                if self.pane_not_found_pane == Some(pane_id) && pane_not_found > 0 {
+                    self.remaining_pane_not_found.set(pane_not_found - 1);
+                    return Ok(ProcessOutput {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: format!(
+                            r#"{{"error":{{"code":"pane_not_found","message":"pane {pane_id} not found"}}}}"#
+                        ),
+                    });
+                }
                 let missing_session_polls = self.missing_session_polls.get();
                 let has_session = state.has_session && missing_session_polls == 0;
                 self.missing_session_polls
@@ -316,8 +344,14 @@ impl ProcessRunner for FakeRunner {
             }),
             Some("agent") if args.get(1).map(String::as_str) == Some("start") => {
                 if let Some(error) = self.agent_start_error {
+                    let pane_id = args
+                        .windows(2)
+                        .find(|pair| pair[0] == "--pane")
+                        .map(|pair| pair[1].as_str());
                     let remaining = self.remaining_agent_start_failures.get();
-                    if remaining != Some(0) {
+                    let pane_matches = self.agent_start_failure_pane.is_none()
+                        || self.agent_start_failure_pane == pane_id;
+                    if pane_matches && remaining != Some(0) {
                         self.remaining_agent_start_failures
                             .set(remaining.map(|count| count.saturating_sub(1)));
                         return Ok(ProcessOutput {
@@ -360,6 +394,7 @@ fn mission_request(mission_id: &str) -> CreateMissionRequest {
         template: "general".into(),
         agent_profile_id: "codex-default-v1".into(),
         agent_profile_version: 1,
+        launch_mode: LaunchMode::Auto,
         roles: default_codex_team(),
     }
 }
@@ -371,24 +406,28 @@ fn simple_mission_request(mission_id: &str) -> CreateMissionRequest {
         template: "general".into(),
         agent_profile_id: "codex-default-v1".into(),
         agent_profile_version: 1,
+        launch_mode: LaunchMode::Manual,
         roles: Provider::Codex.preset_roles(MissionLayout::Simple),
     }
+}
+
+fn manual_mission_request(mission_id: &str) -> CreateMissionRequest {
+    let mut request = mission_request(mission_id);
+    request.launch_mode = LaunchMode::Manual;
+    request
 }
 
 #[test]
 fn launch_mission_starts_all_roles_and_marks_active() {
     let path = temp_db("active");
-    let mission_id = "msn-20260815-120000-demo-1a2b3c4d";
+    let mission_id = "msn-20260827-150000-auto-prompt-1a2b3c4d";
     create_mission(&path, &mission_request(mission_id)).unwrap();
 
     let runner = FakeRunner::success();
     let outcome = launch_mission(
         &path,
         mission_id,
-        &LaunchOptions {
-            launch_mode: LaunchMode::Auto,
-            ..LaunchOptions::default()
-        },
+        &LaunchOptions::default(),
         &runner,
         "herdr",
         &mut |_| {},
@@ -430,6 +469,17 @@ fn launch_mission_starts_all_roles_and_marks_active() {
     for role in ["pm", "worker", "scout", "reviewer"] {
         assert_eq!(status.roles.get(role).map(String::as_str), Some("idle"));
     }
+    assert_eq!(status.launch_mode, LaunchMode::Auto);
+
+    let pm_prompt = std::fs::read_to_string(
+        path.parent()
+            .unwrap()
+            .join("mission-prompts")
+            .join(mission_id)
+            .join("pm.md"),
+    )
+    .unwrap();
+    assert!(pm_prompt.contains("自治模式: auto"));
 
     let connection = Connection::open(&path).unwrap();
     let recorded: i64 = connection
@@ -492,7 +542,6 @@ fn tabs_mode_is_a_legacy_alias_for_the_three_mission_regions() {
 
     let options = LaunchOptions {
         tab_mode: TabMode::Tabs,
-        launch_mode: LaunchMode::Auto,
         ..LaunchOptions::default()
     };
     let runner = FakeRunner::success();
@@ -519,13 +568,13 @@ fn tabs_mode_is_a_legacy_alias_for_the_three_mission_regions() {
 fn manual_mode_launches_only_pm_up_front() {
     let path = temp_db("manual");
     let mission_id = "msn-20260815-120000-demo-1a2b3c4d";
-    create_mission(&path, &mission_request(mission_id)).unwrap();
+    create_mission(&path, &manual_mission_request(mission_id)).unwrap();
 
     let runner = FakeRunner::success();
     let outcome = launch_mission(
         &path,
         mission_id,
-        &LaunchOptions::default(), // Manual by default
+        &LaunchOptions::default(),
         &runner,
         "herdr",
         &mut |_| {},
@@ -553,7 +602,7 @@ fn manual_mode_launches_only_pm_up_front() {
 fn start_role_launches_a_single_role_and_is_idempotent() {
     let path = temp_db("start-role");
     let mission_id = "msn-20260815-120000-demo-1a2b3c4d";
-    create_mission(&path, &mission_request(mission_id)).unwrap();
+    create_mission(&path, &manual_mission_request(mission_id)).unwrap();
 
     let runner = FakeRunner::success();
     let launch = launch_mission(
@@ -574,7 +623,6 @@ fn start_role_launches_a_single_role_and_is_idempotent() {
         "scout",
         &pm_pane,
         "/repo",
-        "manual",
         None,
         &runner,
         "herdr",
@@ -591,7 +639,6 @@ fn start_role_launches_a_single_role_and_is_idempotent() {
         "scout",
         &pm_pane,
         "/repo",
-        "manual",
         None,
         &runner,
         "herdr",
@@ -790,10 +837,7 @@ fn auto_launch_retries_agent_start_when_a_fresh_pane_is_transiently_busy() {
     let outcome = launch_mission(
         &path,
         mission_id,
-        &LaunchOptions {
-            launch_mode: LaunchMode::Auto,
-            ..LaunchOptions::default()
-        },
+        &LaunchOptions::default(),
         &runner,
         "herdr",
         &mut |_| {},
@@ -803,6 +847,134 @@ fn auto_launch_retries_agent_start_when_a_fresh_pane_is_transiently_busy() {
     assert_eq!(outcome.stage, "active");
     assert_eq!(outcome.roles.len(), 4);
     assert_eq!(runner.count_calls("agent", "start"), 5);
+    cleanup(&path);
+}
+
+#[test]
+fn auto_launch_waits_for_a_fresh_split_pane_to_become_visible() {
+    let path = temp_db("fresh-pane-not-found");
+    let mission_id = "msn-20260827-150000-fresh-pane-not-found-0b801f50";
+    create_mission(&path, &mission_request(mission_id)).unwrap();
+    let runner = FakeRunner::recoverable_agent_start(
+        "agent_pane_busy",
+        FakePaneState {
+            agent: "",
+            cwd: ".",
+            tab_label: "工作区",
+            has_session: false,
+        },
+    )
+    .with_agent_start_failures(1)
+    .with_agent_start_failure_pane("w6J:pX")
+    .with_transient_pane_not_found("w6J:pX", 1);
+
+    let outcome = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(outcome.stage, "active");
+    assert_eq!(outcome.roles.len(), 4);
+    assert_eq!(runner.count_calls("agent", "start"), 5);
+    cleanup(&path);
+}
+
+#[test]
+fn auto_launch_stays_blocked_when_a_fresh_pane_never_becomes_visible() {
+    let path = temp_db("fresh-pane-missing");
+    let mission_id = "msn-20260827-150000-fresh-pane-missing-0b801f50";
+    create_mission(&path, &mission_request(mission_id)).unwrap();
+    let runner = FakeRunner::recoverable_agent_start(
+        "agent_pane_busy",
+        FakePaneState {
+            agent: "",
+            cwd: ".",
+            tab_label: "工作区",
+            has_session: false,
+        },
+    )
+    .with_agent_start_failures(1)
+    .with_agent_start_failure_pane("w6J:pX")
+    .with_transient_pane_not_found("w6J:pX", 21);
+
+    let error = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, "launch_effect_failed");
+    assert_eq!(
+        error.details.get("operation"),
+        Some(&serde_json::json!("pane get"))
+    );
+    assert_eq!(runner.count_calls("pane", "get"), 21);
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(runner.count_calls("agent", "start"), 2);
+    assert_eq!(
+        read_mission_status(&path, mission_id).unwrap().stage,
+        "blocked"
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn resume_waits_for_a_persisted_pane_but_starts_it_only_once() {
+    let path = temp_db("persisted-pane-not-found");
+    let mission_id = "msn-20260827-150000-persisted-pane-not-found-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE team_roles SET terminal_id = '' WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+
+    let runner = FakeRunner::new(
+        None,
+        Some(FakePaneState {
+            agent: "",
+            cwd: ".",
+            tab_label: "工作区",
+            has_session: false,
+        }),
+        false,
+    )
+    .with_transient_pane_not_found("w6J:p0", 1);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+    let outcome = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(outcome.stage, "active");
+    assert_eq!(runner.count_calls("pane", "split"), 0);
+    assert_eq!(runner.count_calls("agent", "start"), 1);
     cleanup(&path);
 }
 
@@ -1227,7 +1399,7 @@ fn completed_role_in_a_legacy_tab_moves_into_work_region() {
 fn start_role_adopts_a_late_agent_in_the_work_region() {
     let path = temp_db("start-role-adopt");
     let mission_id = "msn-20260827-082057-rust-version-0b801f50";
-    create_mission(&path, &mission_request(mission_id)).unwrap();
+    create_mission(&path, &manual_mission_request(mission_id)).unwrap();
 
     let initial = FakeRunner::success();
     let launch = launch_mission(
@@ -1256,7 +1428,6 @@ fn start_role_adopts_a_late_agent_in_the_work_region() {
         "scout",
         &pm_pane,
         ".",
-        "manual",
         None,
         &recovery,
         "herdr",
@@ -1275,7 +1446,7 @@ fn start_role_adopts_a_late_agent_in_the_work_region() {
 fn start_role_recovers_a_persisted_unfinished_pane_without_splitting_again() {
     let path = temp_db("start-role-staged");
     let mission_id = "msn-20260827-082057-start-role-staged-0b801f50";
-    create_mission(&path, &mission_request(mission_id)).unwrap();
+    create_mission(&path, &manual_mission_request(mission_id)).unwrap();
     let initial = FakeRunner::success();
     let launch = launch_mission(
         &path,
@@ -1310,7 +1481,6 @@ fn start_role_recovers_a_persisted_unfinished_pane_without_splitting_again() {
         "scout",
         &launch.roles[0].pane_id,
         ".",
-        "manual",
         None,
         &recovery,
         "herdr",
@@ -1331,7 +1501,7 @@ fn start_role_recovers_a_persisted_unfinished_pane_without_splitting_again() {
 fn start_role_rejects_an_anchor_outside_the_work_region_before_split() {
     let path = temp_db("start-role-wrong-region");
     let mission_id = "msn-20260827-082057-wrong-region-0b801f50";
-    create_mission(&path, &mission_request(mission_id)).unwrap();
+    create_mission(&path, &manual_mission_request(mission_id)).unwrap();
     let initial = FakeRunner::success();
     let launch = launch_mission(
         &path,
@@ -1358,7 +1528,6 @@ fn start_role_rejects_an_anchor_outside_the_work_region_before_split() {
         "scout",
         &launch.roles[0].pane_id,
         ".",
-        "manual",
         None,
         &runner,
         "herdr",
@@ -1380,7 +1549,6 @@ fn launch_mission_creates_worktree_workspace() {
     let runner = FakeRunner::success();
     let options = LaunchOptions {
         workspace_source: WorkspaceSource::Worktree,
-        launch_mode: LaunchMode::Auto,
         ..LaunchOptions::default()
     };
     let outcome =

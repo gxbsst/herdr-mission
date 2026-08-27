@@ -36,6 +36,7 @@ const PLUGIN_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS mission_state (
     mission_id TEXT PRIMARY KEY,
     stage TEXT NOT NULL DEFAULT 'preparing',
+    launch_mode TEXT NOT NULL DEFAULT 'manual',
     updated_at TEXT NOT NULL,
     FOREIGN KEY (mission_id) REFERENCES team_missions(mission_id)
         ON DELETE CASCADE
@@ -107,6 +108,8 @@ pub fn bootstrap_database(database: &Path) -> Result<BootstrapOutcome, KernelErr
             error,
         )
     })?;
+    migrate_mission_state(&transaction)
+        .map_err(|error| sqlite_error("sqlite_migration_failed", "migrate_mission_state", error))?;
     transaction
         .execute(
             "INSERT INTO schema_meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO NOTHING",
@@ -157,6 +160,20 @@ fn migrate_mission_workspace(connection: &Connection) -> rusqlite::Result<()> {
                 [],
             )?;
         }
+    }
+    Ok(())
+}
+
+fn migrate_mission_state(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(mission_state)")?;
+    let columns: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !columns.iter().any(|name| name == "launch_mode") {
+        connection.execute(
+            "ALTER TABLE mission_state ADD COLUMN launch_mode TEXT NOT NULL DEFAULT 'manual'",
+            [],
+        )?;
     }
     Ok(())
 }

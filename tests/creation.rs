@@ -5,9 +5,10 @@ use std::{
 
 use herdr_mission::{
     bootstrap_database, create_mission, default_codex_team, delete_mission, make_mission_id,
-    parse_role_ref, read_mission_status, read_workspace, resolve_mission_id, resolve_roles,
-    role_kind, upsert_workspace, utc_timestamp, CreateMissionRequest, MissionLayout,
-    MissionWorkspace, Provider, RoleKind, RoleOverride, WorkspaceSource, TEAM_ROLES,
+    parse_role_ref, read_mission_launch_mode, read_mission_status, read_workspace,
+    resolve_mission_id, resolve_roles, role_kind, set_mission_launch_mode, upsert_workspace,
+    utc_timestamp, CreateMissionRequest, LaunchMode, MissionLayout, MissionWorkspace, Provider,
+    RoleKind, RoleOverride, WorkspaceSource, TEAM_ROLES,
 };
 use rusqlite::Connection;
 
@@ -32,6 +33,7 @@ fn request(mission_id: &str) -> CreateMissionRequest {
         template: "general".into(),
         agent_profile_id: "codex-default-v1".into(),
         agent_profile_version: 1,
+        launch_mode: LaunchMode::Manual,
         roles: default_codex_team(),
     }
 }
@@ -143,12 +145,40 @@ fn read_mission_status_reports_stage_roles_and_pending() {
     let status = read_mission_status(&path, "msn-test-3").unwrap();
     assert_eq!(status.mission_id, "msn-test-3");
     assert_eq!(status.stage, "preparing");
+    assert_eq!(status.launch_mode, LaunchMode::Manual);
     assert_eq!(status.pending_assignments, 0);
     assert_eq!(status.generation, 1);
     assert_eq!(status.roles.len(), TEAM_ROLES.len());
     for role in TEAM_ROLES {
         assert_eq!(status.roles.get(role).map(String::as_str), Some("unknown"));
     }
+
+    cleanup(&path);
+}
+
+#[test]
+fn mission_launch_mode_round_trips_and_switches_both_ways() {
+    let path = temp_db_path("launch-mode");
+    let mut create = request("msn-launch-mode");
+    create.launch_mode = LaunchMode::Auto;
+    create_mission(&path, &create).unwrap();
+
+    assert_eq!(
+        read_mission_launch_mode(&path, "msn-launch-mode").unwrap(),
+        LaunchMode::Auto
+    );
+    set_mission_launch_mode(&path, "msn-launch-mode", LaunchMode::Manual).unwrap();
+    assert_eq!(
+        read_mission_status(&path, "msn-launch-mode")
+            .unwrap()
+            .launch_mode,
+        LaunchMode::Manual
+    );
+    set_mission_launch_mode(&path, "msn-launch-mode", LaunchMode::Auto).unwrap();
+    assert_eq!(
+        read_mission_launch_mode(&path, "msn-launch-mode").unwrap(),
+        LaunchMode::Auto
+    );
 
     cleanup(&path);
 }
