@@ -65,6 +65,30 @@ manifest    校验二进制
 
 用 `herdr-mission <command> --help` 查看单个命令用法。
 
+## Mission 启动模式
+
+Team Mission 支持两种角色启动模式：
+
+- `manual`：只立即启动 PM，Worker、Scout、Reviewer 由 PM 按需启动；这是内置默认值。
+- `auto`：创建 Mission 后立即启动 PM、Worker、Scout、Reviewer。
+
+从 Herdr 执行“新建 Team Mission”时，可以为当前任务输入 `auto` 或 `manual`；
+直接回车则使用全局配置。直接调用 CLI 时也可以显式覆盖：
+
+```sh
+herdr-mission new --title "任务名" --launch-mode auto
+```
+
+全局默认值配置在 `~/.config/herdr-mission/config.toml`：
+
+```toml
+[launch]
+launch_mode = "auto"
+```
+
+优先级为：当前命令的 `--launch-mode` > 全局配置 > 内置 `manual`。配置文件
+缺失、无法读取或内容无效时会安全回退为 `manual`。
+
 ## 结构
 
 ```text

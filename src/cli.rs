@@ -106,7 +106,7 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
     let mut request_id: Option<String> = None;
     let mut prompts_dir: Option<PathBuf> = None;
     let mut autonomy = "manual".to_string();
-    let mut launch_mode = LaunchMode::Manual;
+    let mut launch_mode: Option<LaunchMode> = None;
     let mut role_overrides: Vec<RoleOverride> = Vec::new();
 
     let mut args = args.peekable();
@@ -165,8 +165,8 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
             "--prompts-dir" => prompts_dir = value.map(PathBuf::from),
             "--autonomy" => autonomy = value.unwrap_or_else(|| "manual".into()),
             "--launch-mode" => match value.as_deref() {
-                Some("auto") => launch_mode = LaunchMode::Auto,
-                Some("manual") => launch_mode = LaunchMode::Manual,
+                Some("auto") => launch_mode = Some(LaunchMode::Auto),
+                Some("manual") => launch_mode = Some(LaunchMode::Manual),
                 Some(other) => {
                     return cli_fail(
                         json_mode,
@@ -174,7 +174,7 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                         EXIT_MALFORMED_ARGS,
                     );
                 }
-                None => launch_mode = LaunchMode::Manual,
+                None => launch_mode = None,
             },
             "--role" => match value {
                 Some(spec) => match parse_role_spec(&spec) {
@@ -253,13 +253,14 @@ fn run_new<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
 
             if !no_start {
                 let cwd = source_cwd();
+                let config = LaunchConfig::load();
                 let options = LaunchOptions {
                     direction: "right".into(),
                     cwd,
                     autonomy,
                     prompts_dir,
-                    tab_mode: LaunchConfig::load().launch.tab_mode,
-                    launch_mode,
+                    tab_mode: config.launch.tab_mode,
+                    launch_mode: resolve_launch_mode(launch_mode, &config),
                     workspace_source,
                     worktree_path: None,
                 };
@@ -1807,6 +1808,10 @@ fn doctor(database: PathBuf, json_mode: bool) -> Result<(), KernelError> {
     Ok(())
 }
 
+fn resolve_launch_mode(explicit: Option<LaunchMode>, config: &LaunchConfig) -> LaunchMode {
+    explicit.unwrap_or(config.launch.launch_mode)
+}
+
 pub fn default_database() -> Option<PathBuf> {
     database_path_for(
         std::env::var_os("HERDR_PLUGIN_STATE_DIR").as_deref(),
@@ -1956,8 +1961,26 @@ fn parse_role_spec(spec: &str) -> Result<RoleOverride, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::database_path_for;
+    use super::{database_path_for, resolve_launch_mode};
+    use crate::{LaunchConfig, LaunchMode};
     use std::{ffi::OsStr, path::PathBuf};
+
+    #[test]
+    fn new_launch_mode_prefers_explicit_override_then_config_then_manual() {
+        let auto = LaunchConfig::parse("[launch]\nlaunch_mode = \"auto\"\n").unwrap();
+        let manual = LaunchConfig::default();
+
+        assert_eq!(resolve_launch_mode(None, &auto), LaunchMode::Auto);
+        assert_eq!(
+            resolve_launch_mode(Some(LaunchMode::Manual), &auto),
+            LaunchMode::Manual
+        );
+        assert_eq!(
+            resolve_launch_mode(Some(LaunchMode::Auto), &manual),
+            LaunchMode::Auto
+        );
+        assert_eq!(resolve_launch_mode(None, &manual), LaunchMode::Manual);
+    }
 
     #[test]
     fn database_path_prefers_plugin_state_dir() {
