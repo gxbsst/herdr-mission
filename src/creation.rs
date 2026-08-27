@@ -321,6 +321,7 @@ pub struct RoleRuntimeRow {
     pub model: String,
     pub thinking: String,
     pub pane_id: String,
+    pub agent_name: String,
 }
 
 /// Derive a short, deterministic `[a-z0-9]`-only token from a mission id.
@@ -872,7 +873,7 @@ pub fn read_role_runtime(
     let connection = open_writable(database, OWNER_IDENTITY)?;
     let mut statement = connection
         .prepare(
-            "SELECT role, provider, model, thinking, pane_id
+            "SELECT role, provider, model, thinking, pane_id, terminal_id
              FROM team_roles WHERE mission_id = ?1 ORDER BY role",
         )
         .map_err(|error| sqlite_error("sqlite_roles_read_failed", "read_role_runtime", error))?;
@@ -884,12 +885,37 @@ pub fn read_role_runtime(
                 model: row.get(2)?,
                 thinking: row.get(3)?,
                 pane_id: row.get(4)?,
+                agent_name: row.get(5)?,
             })
         })
         .map_err(|error| sqlite_error("sqlite_roles_read_failed", "read_role_runtime", error))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| sqlite_error("sqlite_roles_read_failed", "read_role_runtime", error))?;
     Ok(rows)
+}
+
+/// Persist the pane allocated to a role before starting its Agent.
+///
+/// This closes the split-to-runtime-record gap: if Agent startup or the final
+/// runtime write fails, resume can reuse the same pane instead of splitting a
+/// duplicate. An empty legacy `terminal_id` marks the allocation as unfinished.
+pub fn record_role_pane(
+    database: &Path,
+    mission_id: &str,
+    role: &str,
+    pane_id: &str,
+) -> Result<(), KernelError> {
+    let connection = open_writable(database, OWNER_IDENTITY)?;
+    let now = utc_timestamp();
+    connection
+        .execute(
+            "UPDATE team_roles
+             SET pane_id = ?1, terminal_id = '', health = 'unknown', updated_at = ?2
+             WHERE mission_id = ?3 AND role = ?4",
+            rusqlite::params![pane_id, now, mission_id, role],
+        )
+        .map_err(|error| sqlite_error("sqlite_role_update_failed", "record_role_pane", error))?;
+    Ok(())
 }
 
 /// Record a role's live runtime identity after its agent is started.

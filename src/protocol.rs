@@ -95,6 +95,7 @@ pub struct DecisionContext {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "request", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Operation {
     Handle(HandleRequest),
     Drive(DriveRequest),

@@ -192,9 +192,7 @@ pub fn read_generation(connection: &Connection) -> Result<i64, KernelError> {
 /// serialized by SQLite's write lock so each observes a strictly greater value
 /// than the last committed one.
 pub fn bump_generation(connection: &mut Connection) -> Result<i64, KernelError> {
-    let next = read_generation(connection)?
-        .checked_add(1)
-        .unwrap_or(i64::MAX);
+    let next = read_generation(connection)?.saturating_add(1);
     connection
         .execute(
             "UPDATE schema_meta SET value = ?1 WHERE key = ?2",

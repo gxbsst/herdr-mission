@@ -8,7 +8,7 @@
 作为 herdr 插件从 GitHub 安装：
 
 ```sh
-herdr plugin install gxbsst/herdr-mission --ref v0.1.0
+herdr plugin install gxbsst/herdr-mission --yes
 ```
 
 安装时 herdr 会 clone 本仓库，执行 `fetch-or-build.sh`：优先从 GitHub Releases 下载
@@ -20,7 +20,7 @@ herdr plugin install gxbsst/herdr-mission --ref v0.1.0
 - 有预编译二进制时无需 Rust；仅当回退源码编译时才需要 Rust 1.88.0
 - [mise](https://mise.jdx.dev) + Rust 1.88.0（`mise use rust@1.88.0`），仅在本地构建/回退编译时需要
 
-二进制本身是单一 `arm64` 可执行文件，运行时无外部依赖。
+每个平台安装的是单一可执行文件，运行时无 Rust 或 Python 依赖。
 
 ## 从源码构建
 
@@ -38,8 +38,8 @@ mise exec rust@1.88.0 -- cargo test --locked
 同时生成 `SHA256SUMS` 和 `COMMIT` 供 `fetch-or-build.sh` 校验。
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 ## 命令
@@ -77,4 +77,4 @@ panes/         herdr pane（Mission 看板）
 ```
 
 状态数据库默认在 `$HERDR_PLUGIN_STATE_DIR/missions.sqlite3`，由 herdr 注入；脱离
-herdr 运行时回退到 `~/.local/share/herdr-mission/missions.sqlite3`。
+herdr 运行时回退到 `~/.local/state/herdr/plugins/weston.herdr-mission/missions.sqlite3`。

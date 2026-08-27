@@ -142,7 +142,7 @@ fn version_discovery_is_machine_readable_and_protocol_explicit() {
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         json!({
             "binary": "herdr-mission",
-            "binary_version": "0.1.0",
+            "binary_version": env!("CARGO_PKG_VERSION"),
             "binary_contract": "herdr.mission.kernel.binary.v1",
             "protocol": "herdr.mission.kernel.v1",
             "operations": ["handle", "drive", "inspect"]

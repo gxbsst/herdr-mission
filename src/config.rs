@@ -9,6 +9,10 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+pub const WORK_REGION_NAME: &str = "工作区";
+pub const REVIEW_REGION_NAME: &str = "审查";
+pub const VERIFICATION_REGION_NAME: &str = "验证";
+
 /// How role/tool panes are laid out when a Mission starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,7 +20,7 @@ pub enum TabMode {
     /// All role panes are split into the current tab (the original behavior).
     #[default]
     Lanes,
-    /// Each role opens in its own tab.
+    /// Legacy alias retained for config compatibility; Agents still share 工作区.
     Tabs,
 }
 
@@ -38,45 +42,10 @@ pub struct LaunchSection {
     pub launch_mode: LaunchMode,
 }
 
-/// Display names for the simple-Mission stage tabs.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct TabsNames {
-    pub execution: String,
-    pub review: String,
-    pub verification: String,
-}
-
-impl Default for TabsNames {
-    fn default() -> Self {
-        Self {
-            execution: "Mission 工作区".to_string(),
-            review: "审查".to_string(),
-            verification: "验证".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct TabsSection {
-    pub execution: bool,
-    pub review: bool,
-    pub verification: bool,
-    pub names: TabsNames,
     pub tools: ToolsSection,
-}
-
-impl Default for TabsSection {
-    fn default() -> Self {
-        Self {
-            execution: true,
-            review: true,
-            verification: true,
-            names: TabsNames::default(),
-            tools: ToolsSection::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,44 +151,33 @@ mod tests {
     }
 
     #[test]
-    fn default_tabs_are_all_enabled_with_builtin_tools() {
+    fn default_regions_use_builtin_tools() {
         let config = LaunchConfig::default();
-        assert!(config.tabs.execution);
-        assert!(config.tabs.review);
-        assert!(config.tabs.verification);
         assert_eq!(config.tabs.tools.editor, "nvim");
         assert_eq!(config.tabs.tools.review, "lazygit");
         assert_eq!(config.tabs.tools.processes, "mprocs");
     }
 
     #[test]
-    fn tabs_section_overrides_defaults() {
+    fn legacy_region_toggles_cannot_disable_fixed_regions() {
         let config =
             LaunchConfig::parse("[tabs]\nreview = false\n[tabs.tools]\neditor = \"vim\"\n")
                 .unwrap();
-        assert!(config.tabs.execution);
-        assert!(!config.tabs.review);
-        assert!(config.tabs.verification);
         assert_eq!(config.tabs.tools.editor, "vim");
         assert_eq!(config.tabs.tools.review, "lazygit");
+        assert_eq!(WORK_REGION_NAME, "工作区");
+        assert_eq!(REVIEW_REGION_NAME, "审查");
+        assert_eq!(VERIFICATION_REGION_NAME, "验证");
     }
 
     #[test]
-    fn tab_names_are_configurable() {
-        let config = LaunchConfig::parse(
+    fn legacy_region_name_overrides_cannot_change_fixed_names() {
+        LaunchConfig::parse(
             "[tabs.names]\nexecution = \"工作区\"\nreview = \"审\"\nverification = \"验\"\n",
         )
         .unwrap();
-        assert_eq!(config.tabs.names.execution, "工作区");
-        assert_eq!(config.tabs.names.review, "审");
-        assert_eq!(config.tabs.names.verification, "验");
-    }
-
-    #[test]
-    fn default_tab_names_use_mission_workspace() {
-        let config = LaunchConfig::default();
-        assert_eq!(config.tabs.names.execution, "Mission 工作区");
-        assert_eq!(config.tabs.names.review, "审查");
-        assert_eq!(config.tabs.names.verification, "验证");
+        assert_eq!(WORK_REGION_NAME, "工作区");
+        assert_eq!(REVIEW_REGION_NAME, "审查");
+        assert_eq!(VERIFICATION_REGION_NAME, "验证");
     }
 }

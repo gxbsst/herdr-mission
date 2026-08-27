@@ -31,7 +31,8 @@ pub use bootstrap::{
     KEY_GENERATION, KEY_OWNER, KEY_SCHEMA_VERSION, OWNER_IDENTITY, SCHEMA_VERSION,
 };
 pub use config::{
-    LaunchConfig, LaunchMode, LaunchSection, TabMode, TabsNames, TabsSection, ToolsSection,
+    LaunchConfig, LaunchMode, LaunchSection, TabMode, TabsSection, ToolsSection,
+    REVIEW_REGION_NAME, VERIFICATION_REGION_NAME, WORK_REGION_NAME,
 };
 pub use coordination::{
     kernel_deliver, kernel_dispatch_command, kernel_read_context, kernel_reply_command,
@@ -42,11 +43,11 @@ pub use creation::{
     agent_name_token, create_mission, default_codex_team, delete_mission, is_valid_role_identity,
     list_missions, make_mission_id, parse_role_ref, pi_quality_team, read_mission_overviews,
     read_mission_state, read_mission_status, read_mission_title, read_role_runtime,
-    record_role_runtime, resolve_mission_id, resolve_roles, role_kind, set_mission_stage, slugify,
-    utc_timestamp, CreateMissionOutcome, CreateMissionRequest, DeleteMissionOutcome, MissionLayout,
-    MissionOverview, MissionStatus, MissionSummary, Provider, RoleConfig, RoleOverride,
-    RoleOverview, RoleRuntimeRow, DEFAULT_AGENT_PROFILE_ID, DEFAULT_AGENT_PROFILE_VERSION,
-    PI_QUALITY_PROFILE_ID, TEAM_ROLES,
+    record_role_pane, record_role_runtime, resolve_mission_id, resolve_roles, role_kind,
+    set_mission_stage, slugify, utc_timestamp, CreateMissionOutcome, CreateMissionRequest,
+    DeleteMissionOutcome, MissionLayout, MissionOverview, MissionStatus, MissionSummary, Provider,
+    RoleConfig, RoleOverride, RoleOverview, RoleRuntimeRow, DEFAULT_AGENT_PROFILE_ID,
+    DEFAULT_AGENT_PROFILE_VERSION, PI_QUALITY_PROFILE_ID, TEAM_ROLES,
 };
 pub use daemon::{request_stop, run_daemon, DaemonLock};
 pub use domain::{EffectExecutor, MissionKernel};
@@ -56,10 +57,12 @@ pub use effects::{
     SystemProcessRunner,
 };
 pub use herdr::{
-    agent_rename_argv, pane_rename_argv, pane_run_argv, pane_split_argv, pane_split_in_argv,
-    parse_pane_split, parse_tab_create, parse_workspace_create, parse_worktree_create,
-    tab_create_argv, workspace_close_argv, workspace_create_argv, worktree_create_argv,
-    worktree_open_argv, PaneCreated, TabCreated, WorkspaceCreated, WorktreeCreated,
+    agent_rename_argv, pane_get_argv, pane_list_argv, pane_move_to_tab_argv, pane_rename_argv,
+    pane_run_argv, pane_split_argv, pane_split_in_argv, parse_pane_get, parse_pane_list,
+    parse_pane_split, parse_tab_create, parse_tab_get, parse_tab_list, parse_workspace_create,
+    parse_worktree_create, tab_create_argv, tab_get_argv, tab_list_argv, tab_rename_argv,
+    workspace_close_argv, workspace_create_argv, worktree_create_argv, worktree_open_argv,
+    PaneCreated, PaneInfo, PaneLocation, TabCreated, TabInfo, WorkspaceCreated, WorktreeCreated,
 };
 pub use log::{log_error, log_event, log_mission_error};
 pub use manifest::{

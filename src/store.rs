@@ -444,6 +444,7 @@ pub(crate) struct StoreObservation {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum CoordinationStore {
     Memory(MemoryCoordinationStore),
     TemporarySqliteV3 {

@@ -333,7 +333,7 @@ fn manifest_generates_writes_and_verifies_binary() {
     );
     let value: Value = serde_json::from_slice(&generated.stdout).unwrap();
     assert_eq!(value["status"], "ok");
-    assert_eq!(value["manifest"]["version"], "0.1.0");
+    assert_eq!(value["manifest"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
         value["manifest"]["sha256"],
         "c16a40a4584e5bccc84b45172fcdfa922f59ff1edebf3adba7b8266ea04eb39a"

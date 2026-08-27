@@ -32,6 +32,33 @@ pub struct PaneCreated {
     pub pane_id: String,
 }
 
+/// Structured identity returned by `herdr pane get` for launch recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneInfo {
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub pane_id: String,
+    pub agent: String,
+    pub cwd: String,
+    pub has_agent_session: bool,
+}
+
+/// Stable pane location returned by `herdr pane list` during region recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneLocation {
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub pane_id: String,
+}
+
+/// Structured identity returned by `herdr tab get` for region validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabInfo {
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub label: String,
+}
+
 /// Identifiers returned by `herdr worktree create` / `worktree open`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreated {
@@ -85,6 +112,31 @@ pub fn tab_create_argv(
     argv
 }
 
+/// Build argv for `herdr tab get` so launch recovery can validate the region.
+pub fn tab_get_argv(tab_id: &str) -> Vec<String> {
+    vec!["tab".to_string(), "get".to_string(), tab_id.to_string()]
+}
+
+/// Build argv for listing tabs in one workspace during crash recovery.
+pub fn tab_list_argv(workspace_id: &str) -> Vec<String> {
+    vec![
+        "tab".to_string(),
+        "list".to_string(),
+        "--workspace".to_string(),
+        workspace_id.to_string(),
+    ]
+}
+
+/// Build argv for `herdr tab rename` with the Mission region label.
+pub fn tab_rename_argv(tab_id: &str, label: &str) -> Vec<String> {
+    vec![
+        "tab".to_string(),
+        "rename".to_string(),
+        tab_id.to_string(),
+        label.to_string(),
+    ]
+}
+
 /// Build argv for a sibling `herdr pane split` that preserves the caller's cwd
 /// and keeps the user's focus unchanged.
 pub fn pane_split_argv(direction: &str, cwd: &str) -> Vec<String> {
@@ -110,6 +162,37 @@ pub fn pane_split_in_argv(direction: &str, cwd: &str, pane_id: &str) -> Vec<Stri
         direction.to_string(),
         "--cwd".to_string(),
         cwd.to_string(),
+        "--no-focus".to_string(),
+    ]
+}
+
+/// Build argv for `herdr pane get` so launch recovery uses structured state.
+pub fn pane_get_argv(pane_id: &str) -> Vec<String> {
+    vec!["pane".to_string(), "get".to_string(), pane_id.to_string()]
+}
+
+/// Build argv for listing panes in one workspace during region recovery.
+pub fn pane_list_argv(workspace_id: &str) -> Vec<String> {
+    vec![
+        "pane".to_string(),
+        "list".to_string(),
+        "--workspace".to_string(),
+        workspace_id.to_string(),
+    ]
+}
+
+/// Move an existing pane into the Mission work region without stealing focus.
+pub fn pane_move_to_tab_argv(pane_id: &str, tab_id: &str, target_pane_id: &str) -> Vec<String> {
+    vec![
+        "pane".to_string(),
+        "move".to_string(),
+        pane_id.to_string(),
+        "--tab".to_string(),
+        tab_id.to_string(),
+        "--split".to_string(),
+        "right".to_string(),
+        "--target-pane".to_string(),
+        target_pane_id.to_string(),
         "--no-focus".to_string(),
     ]
 }
@@ -218,6 +301,81 @@ pub fn parse_pane_split(response: &str) -> Result<PaneCreated, KernelError> {
     })
 }
 
+/// Parse the structured `herdr pane get` response used for safe Agent adoption.
+pub fn parse_pane_get(response: &str) -> Result<PaneInfo, KernelError> {
+    let value = parse_json(response, "pane get")?;
+    let result = field(&value, "result", "pane get")?;
+    let pane = field(result, "pane", "pane get")?;
+    let cwd = optional_string_field(pane, "foreground_cwd")
+        .or_else(|| optional_string_field(pane, "cwd"))
+        .ok_or_else(|| missing_field("pane get", "foreground_cwd|cwd"))?;
+    let has_agent_session = pane
+        .get("agent_session")
+        .and_then(|session| session.get("value"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+
+    Ok(PaneInfo {
+        workspace_id: string_field(pane, "workspace_id", "pane get")?,
+        tab_id: string_field(pane, "tab_id", "pane get")?,
+        pane_id: string_field(pane, "pane_id", "pane get")?,
+        agent: optional_string_field(pane, "agent").unwrap_or_default(),
+        cwd,
+        has_agent_session,
+    })
+}
+
+/// Parse `herdr pane list --workspace` for a recovered region's root pane.
+pub fn parse_pane_list(response: &str) -> Result<Vec<PaneLocation>, KernelError> {
+    let value = parse_json(response, "pane list")?;
+    let result = field(&value, "result", "pane list")?;
+    let panes = result
+        .get("panes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| missing_field("pane list", "panes"))?;
+    panes
+        .iter()
+        .map(|pane| {
+            Ok(PaneLocation {
+                workspace_id: string_field(pane, "workspace_id", "pane list")?,
+                tab_id: string_field(pane, "tab_id", "pane list")?,
+                pane_id: string_field(pane, "pane_id", "pane list")?,
+            })
+        })
+        .collect()
+}
+
+/// Parse the structured `herdr tab get` response used for region validation.
+pub fn parse_tab_get(response: &str) -> Result<TabInfo, KernelError> {
+    let value = parse_json(response, "tab get")?;
+    let result = field(&value, "result", "tab get")?;
+    let tab = field(result, "tab", "tab get")?;
+    Ok(TabInfo {
+        workspace_id: string_field(tab, "workspace_id", "tab get")?,
+        tab_id: string_field(tab, "tab_id", "tab get")?,
+        label: string_field(tab, "label", "tab get")?,
+    })
+}
+
+/// Parse `herdr tab list --workspace` for unique fixed-region discovery.
+pub fn parse_tab_list(response: &str) -> Result<Vec<TabInfo>, KernelError> {
+    let value = parse_json(response, "tab list")?;
+    let result = field(&value, "result", "tab list")?;
+    let tabs = result
+        .get("tabs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| missing_field("tab list", "tabs"))?;
+    tabs.iter()
+        .map(|tab| {
+            Ok(TabInfo {
+                workspace_id: string_field(tab, "workspace_id", "tab list")?,
+                tab_id: string_field(tab, "tab_id", "tab list")?,
+                label: string_field(tab, "label", "tab list")?,
+            })
+        })
+        .collect()
+}
+
 /// Parse the `herdr worktree create` / `worktree open` response.
 pub fn parse_worktree_create(response: &str) -> Result<WorktreeCreated, KernelError> {
     let value = parse_json(response, "worktree create")?;
@@ -277,6 +435,14 @@ fn string_field(value: &Value, key: &str, operation: &str) -> Result<String, Ker
         .filter(|text| !text.is_empty())
         .map(str::to_string)
         .ok_or_else(|| missing_field(operation, key))
+}
+
+fn optional_string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 /// Read `value[object][key]` as a non-empty string. Herdr's `WorkspaceCreated`
@@ -354,6 +520,100 @@ mod tests {
             PaneCreated {
                 pane_id: "w1:p3".into()
             }
+        );
+    }
+
+    #[test]
+    fn parses_pane_get_response_for_agent_recovery() {
+        let parsed = parse_pane_get(
+            r#"{"result":{"pane":{"agent":"codex","agent_session":{"agent":"codex","kind":"id","source":"herdr:codex","value":"session-1"},"cwd":"/repo","foreground_cwd":"/repo/.worktree/rust-version","pane_id":"w16:p1","tab_id":"w16:t1","workspace_id":"w16"},"type":"pane_info"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            PaneInfo {
+                workspace_id: "w16".into(),
+                tab_id: "w16:t1".into(),
+                pane_id: "w16:p1".into(),
+                agent: "codex".into(),
+                cwd: "/repo/.worktree/rust-version".into(),
+                has_agent_session: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_tab_get_response_for_region_recovery() {
+        let parsed = parse_tab_get(
+            r#"{"result":{"tab":{"label":"工作区","tab_id":"w16:t1","workspace_id":"w16"},"type":"tab_info"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            TabInfo {
+                workspace_id: "w16".into(),
+                tab_id: "w16:t1".into(),
+                label: "工作区".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn builds_pane_get_and_tab_region_commands() {
+        assert_eq!(pane_get_argv("w16:p1"), vec!["pane", "get", "w16:p1"]);
+        assert_eq!(
+            pane_list_argv("w16"),
+            vec!["pane", "list", "--workspace", "w16"]
+        );
+        assert_eq!(tab_get_argv("w16:t1"), vec!["tab", "get", "w16:t1"]);
+        assert_eq!(
+            tab_list_argv("w16"),
+            vec!["tab", "list", "--workspace", "w16"]
+        );
+        assert_eq!(
+            tab_rename_argv("w16:t1", "工作区"),
+            vec!["tab", "rename", "w16:t1", "工作区"]
+        );
+        assert_eq!(
+            pane_move_to_tab_argv("w16:p2", "w16:t1", "w16:p1"),
+            vec![
+                "pane",
+                "move",
+                "w16:p2",
+                "--tab",
+                "w16:t1",
+                "--split",
+                "right",
+                "--target-pane",
+                "w16:p1",
+                "--no-focus",
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_tab_list_for_region_discovery() {
+        let tabs = parse_tab_list(
+            r#"{"result":{"tabs":[{"workspace_id":"w16","tab_id":"w16:t1","label":"工作区"},{"workspace_id":"w16","tab_id":"w16:t2","label":"审查"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[1].label, "审查");
+    }
+
+    #[test]
+    fn parses_pane_list_for_region_recovery() {
+        let panes = parse_pane_list(
+            r#"{"result":{"panes":[{"workspace_id":"w16","tab_id":"w16:t1","pane_id":"w16:p1"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            panes,
+            vec![PaneLocation {
+                workspace_id: "w16".into(),
+                tab_id: "w16:t1".into(),
+                pane_id: "w16:p1".into(),
+            }]
         );
     }
 
