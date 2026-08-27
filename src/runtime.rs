@@ -29,8 +29,7 @@ use crate::{
     WorkspaceSource, REVIEW_REGION_NAME, VERIFICATION_REGION_NAME, WORK_REGION_NAME,
 };
 
-/// How many times to re-attempt `agent start` after a transient
-/// `agent_pane_busy` (the freshly split shell pane has not reached its prompt).
+/// How many times to poll or re-attempt after delayed Agent/shell readiness.
 const AGENT_RECOVERY_POLLS: u32 = 20;
 const AGENT_START_RETRY_DELAY: Duration = Duration::from_millis(250);
 
@@ -1037,7 +1036,7 @@ fn ensure_agent_running(
             }
         }
     }
-    start_agent(runner, herdr, command, recovery)
+    start_agent(runner, herdr, command, recovery, !staged)
 }
 
 fn start_agent(
@@ -1045,33 +1044,57 @@ fn start_agent(
     herdr: &str,
     command: &[String],
     recovery: &AgentRecoveryTarget<'_>,
+    retry_fresh_busy: bool,
 ) -> Result<(), KernelError> {
-    let output = run(runner, herdr, command)?;
-    if output.exit_code == 0 {
-        return Ok(());
-    }
+    let mut busy_retries = 0;
+    loop {
+        let output = run(runner, herdr, command)?;
+        if output.exit_code == 0 {
+            return Ok(());
+        }
 
-    if is_agent_start_timeout(&output) {
-        let original = launch_failed("agent start", &output);
-        for poll in 0..=AGENT_RECOVERY_POLLS {
-            match adopt_running_agent(runner, herdr, recovery)? {
-                AgentAdoption::Adopted => return Ok(()),
-                AgentAdoption::Empty | AgentAdoption::PendingSession
-                    if poll < AGENT_RECOVERY_POLLS =>
-                {
-                    std::thread::sleep(AGENT_START_RETRY_DELAY);
+        if is_agent_start_timeout(&output) {
+            let original = launch_failed("agent start", &output);
+            for poll in 0..=AGENT_RECOVERY_POLLS {
+                match adopt_running_agent(runner, herdr, recovery)? {
+                    AgentAdoption::Adopted => return Ok(()),
+                    AgentAdoption::Empty | AgentAdoption::PendingSession
+                        if poll < AGENT_RECOVERY_POLLS =>
+                    {
+                        std::thread::sleep(AGENT_START_RETRY_DELAY);
+                    }
+                    AgentAdoption::Empty | AgentAdoption::PendingSession => return Err(original),
                 }
-                AgentAdoption::Empty | AgentAdoption::PendingSession => return Err(original),
             }
         }
-    }
 
-    if is_agent_pane_busy(&output)
-        && adopt_running_agent(runner, herdr, recovery)? == AgentAdoption::Adopted
-    {
-        return Ok(());
+        if !is_agent_pane_busy(&output) {
+            return Err(launch_failed("agent start", &output));
+        }
+
+        let original = launch_failed("agent start", &output);
+        match adopt_running_agent(runner, herdr, recovery)? {
+            AgentAdoption::Adopted => return Ok(()),
+            AgentAdoption::PendingSession => {
+                for poll in 0..AGENT_RECOVERY_POLLS {
+                    std::thread::sleep(AGENT_START_RETRY_DELAY);
+                    match adopt_running_agent(runner, herdr, recovery)? {
+                        AgentAdoption::Adopted => return Ok(()),
+                        AgentAdoption::PendingSession if poll + 1 < AGENT_RECOVERY_POLLS => {}
+                        AgentAdoption::Empty | AgentAdoption::PendingSession => {
+                            return Err(original);
+                        }
+                    }
+                }
+                return Err(original);
+            }
+            AgentAdoption::Empty if retry_fresh_busy && busy_retries < AGENT_RECOVERY_POLLS => {
+                busy_retries += 1;
+                std::thread::sleep(AGENT_START_RETRY_DELAY);
+            }
+            AgentAdoption::Empty => return Err(original),
+        }
     }
-    Err(launch_failed("agent start", &output))
 }
 
 fn adopt_running_agent(
@@ -1086,9 +1109,6 @@ fn adopt_running_agent(
     let actual = parse_pane_get(&output.stdout)
         .map_err(|error| recovery_rejected(expected, None, error.message))?;
 
-    if actual.agent.is_empty() && !actual.has_agent_session {
-        return Ok(AgentAdoption::Empty);
-    }
     if actual.pane_id != expected.pane_id {
         return Err(recovery_rejected(
             expected,
@@ -1101,13 +1121,6 @@ fn adopt_running_agent(
             expected,
             Some(&actual),
             "workspace does not match Mission",
-        ));
-    }
-    if actual.agent != expected.provider {
-        return Err(recovery_rejected(
-            expected,
-            Some(&actual),
-            "Agent provider does not match role",
         ));
     }
     if !same_path(&actual.cwd, expected.cwd) {
@@ -1144,6 +1157,16 @@ fn adopt_running_agent(
         }
     }
 
+    if actual.agent.is_empty() && !actual.has_agent_session {
+        return Ok(AgentAdoption::Empty);
+    }
+    if actual.agent != expected.provider {
+        return Err(recovery_rejected(
+            expected,
+            Some(&actual),
+            "Agent provider does not match role",
+        ));
+    }
     if !actual.has_agent_session {
         return Ok(AgentAdoption::PendingSession);
     }

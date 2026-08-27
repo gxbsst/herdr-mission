@@ -8,6 +8,7 @@
 - Herdr 的“新建 Team Mission”动作在标题之后询问本次启动模式，接受 `auto`、`manual` 或回车使用配置默认值。
 - 单次显式选择优先于全局配置，并将选择作为 `--launch-mode` 传给 Rust CLI。
 - 为配置默认值、显式覆盖和动作输入校验增加回归测试与使用说明。
+- 对当前调用刚创建的 Agent pane，在结构化确认仍属于 Mission 工作区且没有 Agent 后，有限重试瞬时 `agent_pane_busy`，避免 Auto 连续启动因 shell 尚未 ready 而中断。
 - 发布新的预编译 GitHub release，并在 `sqbair` 通过 `herdr plugin install` 安装验证。
 
 ## Capabilities
@@ -22,7 +23,7 @@
 
 ## Impact
 
-- Rust CLI：`src/cli.rs` 的 `new` 参数默认值解析。
+- Rust CLI 与 runtime：`src/cli.rs` 的 `new` 参数默认值解析，以及 `src/runtime.rs` 的 fresh pane 就绪重试。
 - Herdr 插件动作：`actions/mission-new.sh` 的交互输入与参数传递。
 - 测试与文档：CLI 配置继承、动作选择行为、用户配置示例。
 - 发布元数据：`Cargo.toml`、`Cargo.lock`、`herdr-plugin.toml`、Git tag 与 GitHub release。

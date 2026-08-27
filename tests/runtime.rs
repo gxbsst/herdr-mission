@@ -37,6 +37,7 @@ struct FakeRunner {
     tab_labels: RefCell<BTreeMap<String, String>>,
     pane_tabs: RefCell<BTreeMap<String, String>>,
     missing_session_polls: Cell<u32>,
+    remaining_agent_start_failures: Cell<Option<u32>>,
 }
 
 #[derive(Clone, Copy)]
@@ -67,6 +68,7 @@ impl FakeRunner {
             )])),
             pane_tabs: RefCell::new(BTreeMap::new()),
             missing_session_polls: Cell::new(0),
+            remaining_agent_start_failures: Cell::new(None),
         }
     }
 
@@ -89,6 +91,11 @@ impl FakeRunner {
 
     fn with_missing_session_polls(self, polls: u32) -> Self {
         self.missing_session_polls.set(polls);
+        self
+    }
+
+    fn with_agent_start_failures(self, failures: u32) -> Self {
+        self.remaining_agent_start_failures.set(Some(failures));
         self
     }
 
@@ -309,18 +316,22 @@ impl ProcessRunner for FakeRunner {
             }),
             Some("agent") if args.get(1).map(String::as_str) == Some("start") => {
                 if let Some(error) = self.agent_start_error {
-                    Ok(ProcessOutput {
-                        exit_code: 1,
-                        stdout: String::new(),
-                        stderr: error.into(),
-                    })
-                } else {
-                    Ok(ProcessOutput {
-                        exit_code: 0,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                    })
+                    let remaining = self.remaining_agent_start_failures.get();
+                    if remaining != Some(0) {
+                        self.remaining_agent_start_failures
+                            .set(remaining.map(|count| count.saturating_sub(1)));
+                        return Ok(ProcessOutput {
+                            exit_code: 1,
+                            stdout: String::new(),
+                            stderr: error.into(),
+                        });
+                    }
                 }
+                Ok(ProcessOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
             }
             Some("agent") if args.get(1).map(String::as_str) == Some("rename") => {
                 Ok(ProcessOutput {
@@ -708,7 +719,6 @@ fn launch_adopts_expected_agent_when_pane_is_busy() {
             has_session: true,
         },
     );
-
     let outcome = launch_mission(
         &path,
         mission_id,
@@ -729,10 +739,94 @@ fn launch_adopts_expected_agent_when_pane_is_busy() {
 }
 
 #[test]
-fn launch_does_not_repeat_agent_start_when_busy_pane_has_no_agent_identity() {
+fn launch_polls_busy_agent_until_its_session_appears_without_restarting() {
+    let path = temp_db("busy-session-late");
+    let mission_id = "msn-20260827-082057-busy-session-late-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    let runner = FakeRunner::recoverable_agent_start(
+        "agent_pane_busy",
+        FakePaneState {
+            agent: "codex",
+            cwd: ".",
+            tab_label: "工作区",
+            has_session: true,
+        },
+    )
+    .with_missing_session_polls(1);
+
+    let outcome = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(outcome.stage, "active");
+    assert_eq!(runner.count_calls("agent", "start"), 1);
+    assert_eq!(runner.count_calls("pane", "get"), 2);
+    assert_eq!(runner.count_calls("agent", "rename"), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn auto_launch_retries_agent_start_when_a_fresh_pane_is_transiently_busy() {
+    let path = temp_db("fresh-busy-retry");
+    let mission_id = "msn-20260827-082057-fresh-busy-retry-0b801f50";
+    create_mission(&path, &mission_request(mission_id)).unwrap();
+    let runner = FakeRunner::recoverable_agent_start(
+        "agent_pane_busy",
+        FakePaneState {
+            agent: "",
+            cwd: ".",
+            tab_label: "工作区",
+            has_session: false,
+        },
+    )
+    .with_agent_start_failures(1);
+
+    let outcome = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions {
+            launch_mode: LaunchMode::Auto,
+            ..LaunchOptions::default()
+        },
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(outcome.stage, "active");
+    assert_eq!(outcome.roles.len(), 4);
+    assert_eq!(runner.count_calls("agent", "start"), 5);
+    cleanup(&path);
+}
+
+#[test]
+fn launch_does_not_repeat_agent_start_when_persisted_busy_pane_has_no_agent_identity() {
     let path = temp_db("busy-unidentified");
     let mission_id = "msn-20260827-082057-busy-unidentified-0b801f50";
     create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE team_roles SET terminal_id = '' WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
     let runner = FakeRunner::recoverable_agent_start(
         "agent_pane_busy",
         FakePaneState {
@@ -742,6 +836,8 @@ fn launch_does_not_repeat_agent_start_when_busy_pane_has_no_agent_identity() {
             has_session: false,
         },
     );
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
 
     let error = launch_mission(
         &path,
@@ -755,7 +851,38 @@ fn launch_does_not_repeat_agent_start_when_busy_pane_has_no_agent_identity() {
 
     assert_eq!(error.code, "launch_effect_failed");
     assert_eq!(runner.count_calls("agent", "start"), 1);
-    assert_eq!(runner.count_calls("pane", "get"), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn fresh_busy_pane_is_not_retried_when_its_cwd_does_not_match() {
+    let path = temp_db("fresh-busy-wrong-cwd");
+    let mission_id = "msn-20260827-082057-fresh-busy-wrong-cwd-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    let runner = FakeRunner::recoverable_agent_start(
+        "agent_pane_busy",
+        FakePaneState {
+            agent: "",
+            cwd: "/repo/other",
+            tab_label: "工作区",
+            has_session: false,
+        },
+    )
+    .with_agent_start_failures(1);
+
+    let error = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, "launch_effect_failed");
+    assert_eq!(error.message, "running Agent could not be safely adopted");
+    assert_eq!(runner.count_calls("agent", "start"), 1);
     cleanup(&path);
 }
 

@@ -40,9 +40,17 @@ Rust 单元测试覆盖显式值优先、配置值继承和内置 Manual 回退�
 
 该组合直接锁定本次两个缺口；现有 runtime 测试继续证明 Auto/Manual 的角色启动差异，无需重复构造完整 Herdr 模拟环境。
 
-### 4. 以 v0.1.3 发布并复用现有预编译链路
+### 4. fresh pane 的 busy 只在结构化归属验证后有限重试
 
-版本同步提升到 `0.1.3`。推送 `v0.1.3` 后由现有 GitHub Actions 构建三个目标平台，生成 `SHA256SUMS` 与 `COMMIT`。`sqbair` 继续通过已认证的 `herdr plugin install gxbsst/herdr-mission --yes` 下载预编译产物，不依赖 Python 或现场 Cargo 编译。
+`sqbair` 的 `v0.1.3` Auto canary 证明：连续启动角色时，刚由 runtime split 的 pane 可能已经存在且 cwd 正确，但 shell 尚未进入 Herdr 认为可用的状态；此时第一次 `agent start` 返回 `agent_pane_busy`，`pane get` 仍显示无 Agent session。旧逻辑只尝试接管已有 Agent，因此立即把 Mission 标记为 blocked。
+
+runtime 将“当前调用刚分配的 pane”和“此前已持久化的 pane”区分处理。fresh pane 返回 busy 时，先结构化验证 pane ID、workspace、cwd、工作区 tab ID 与名称；只有全部匹配且没有 Agent/session，才按现有 250ms 间隔有限重试同一条 `agent start`。若 Agent 身份已经出现，则继续原有接管路径，不重复启动；若归属不匹配，立即失败关闭。
+
+此前已持久化的空 pane 不启用重复 `agent start`，保留 `v0.1.2` 的保守边界，避免对可能正在运行非 Agent 前台进程的历史 pane 反复注入命令。没有选择固定 sleep，因为 pane 的实际 ready 时间不稳定，固定等待会无条件增加每个角色的启动延迟。
+
+### 5. 以 v0.1.4 发布并复用现有预编译链路
+
+`v0.1.3` 已完成入口发布并在 `sqbair` 发现上述 fresh pane 竞态。最终版本同步提升到 `0.1.4`；推送 tag 后仍由现有 GitHub Actions 构建三个目标平台，生成 `SHA256SUMS` 与 `COMMIT`。`sqbair` 继续通过已认证的 `herdr plugin install gxbsst/herdr-mission --yes` 下载预编译产物，不依赖 Python 或现场 Cargo 编译。
 
 ## Risks / Trade-offs
 
@@ -50,6 +58,8 @@ Rust 单元测试覆盖显式值优先、配置值继承和内置 Manual 回退�
 - [用户误拼模式] -> 在调用二进制前失败关闭并列出仅接受的值。
 - [无效配置被静默回退] -> 延续 `LaunchConfig::load` 现有兼容语义；`doctor` 行为不在本次扩大。
 - [显式参数与配置读取顺序混淆] -> 用单一解析优先级函数和测试固定“显式覆盖 > 配置 > Manual”。
+- [busy pane 实际已被移动或改作他用] -> 每次重试前核对 pane ID、workspace、cwd 和精确“工作区”tab；只允许本次 fresh pane 重试。
+- [Agent 已启动但 session 延迟出现] -> 发现 provider 身份后只轮询接管，不再执行第二次 `agent start`。
 - [私有仓库 release 下载依赖认证] -> 发布端和安装端分别用 `gh` 当前登录态验证；安装后核对版本及 release manifest。
 
 ## Migration Plan
@@ -57,11 +67,12 @@ Rust 单元测试覆盖显式值优先、配置值继承和内置 Manual 回退�
 1. 新增失败回归测试，覆盖 `new` 配置继承和动作选择。
 2. 修改 CLI 与动作脚本并完成完整测试。
 3. 更新 README 的模式说明和配置示例。
-4. 将版本提升到 `0.1.3`，提交并推送 `master` 与 `v0.1.3`。
-5. 等待 GitHub release 三平台资产、校验文件和 commit 绑定全部完成。
-6. 在 `sqbair` 重装插件，验证二进制为 `0.1.3` 且 Auto 新建能启动四个角色。
+4. 记录 `v0.1.3` canary 的 `agent_pane_busy` 失败，增加 fresh pane RED 测试并实现有限重试。
+5. 将最终版本提升到 `0.1.4`，提交并推送 `master` 与 `v0.1.4`。
+6. 等待 GitHub release 三平台资产、校验文件和 commit 绑定全部完成。
+7. 在 `sqbair` 重装插件，恢复 canary 并验证 `0.1.4` 的 Auto 新建能启动四个角色。
 
-回滚时重新安装 `v0.1.2`；本变更不迁移数据库，已创建 Mission 仍可读取。
+回滚时重新安装 `v0.1.3`；本变更不迁移数据库，已创建 Mission 仍可读取。
 
 ## Open Questions
 
