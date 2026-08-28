@@ -154,6 +154,40 @@ fn worker_completion_input(assignment_id: &str) -> KernelInput {
     }
 }
 
+fn blocked_reply_input(
+    command_id: &str,
+    assignment_id: &str,
+    source: RoleKind,
+    id_suffix: &str,
+) -> KernelInput {
+    KernelInput {
+        decision_context: DecisionContext {
+            observed_at: "2026-08-14T05:02:00Z".into(),
+            allocated_ids: BTreeMap::from([
+                ("message".into(), format!("msg-{id_suffix}")),
+                ("outbox".into(), format!("out-{id_suffix}")),
+            ]),
+            generations: BTreeMap::from([("pm".into(), generation("generation-pm"))]),
+        },
+        input: HandleInput::Command {
+            command_id: command_id.into(),
+            kind: "blocked".into(),
+            source: RoleRef {
+                role: source,
+                instance: None,
+            },
+            target: Some(RoleRef {
+                role: RoleKind::Pm,
+                instance: None,
+            }),
+            body: json!({
+                "assignment_id": assignment_id,
+                "text": "capacity released"
+            }),
+        },
+    }
+}
+
 fn pm_assignment_input(
     command_id: &str,
     kind: &str,
@@ -764,7 +798,7 @@ fn worker_completed_creates_one_reviewer_follow_up_in_the_same_receipt() {
 }
 
 #[test]
-fn worker_completion_cannot_emit_reviewer_follow_up_while_reviewer_capacity_is_held() {
+fn worker_completion_queues_reviewer_follow_up_while_reviewer_capacity_is_held() {
     let mut kernel = MissionKernel::in_memory("msn-20260814-123000-rust-kernel-abcd");
     let review = kernel
         .handle(pm_assignment_input(
@@ -783,24 +817,66 @@ fn worker_completion_cannot_emit_reviewer_follow_up_while_reviewer_capacity_is_h
 
     let worker = kernel.handle(task_input()).unwrap();
     activate(&mut kernel, &worker, "worker");
-    let before = kernel.inspect(InspectQuery::Status).unwrap();
-
     let completion = kernel
         .handle(worker_completion_input(&worker.created_ids["assignment"]))
         .unwrap();
 
-    assert_eq!(completion.disposition, HandleDisposition::Rejected);
-    assert_eq!(completion.error.unwrap().code, "role_capacity_exhausted");
-    assert!(completion.effect_intents.is_empty());
-    let after = kernel.inspect(InspectQuery::Status).unwrap();
-    assert_eq!(after.data["revision"], before.data["revision"]);
-    assert_eq!(after.data["assignment_count"], 2);
+    assert_eq!(completion.disposition, HandleDisposition::Applied);
+    assert_eq!(
+        completion.assignment_state,
+        Some(AssignmentState::Completed)
+    );
+    assert_eq!(completion.effect_intents.len(), 2);
+    let follow_up_assignment = completion.created_ids["follow_up_assignment"].clone();
     let worker_thread = kernel
         .inspect(InspectQuery::AssignmentThread {
             assignment_id: worker.created_ids["assignment"].clone(),
         })
         .unwrap();
-    assert_eq!(worker_thread.data["assignment"]["state"], "active");
+    assert_eq!(worker_thread.data["assignment"]["state"], "completed");
+    let review_thread = kernel
+        .inspect(InspectQuery::AssignmentThread {
+            assignment_id: follow_up_assignment,
+        })
+        .unwrap();
+    assert_eq!(review_thread.data["assignment"]["state"], "queued");
+
+    let follow_up_effect = &completion.effect_intents[1];
+    let waiting = kernel
+        .drive(
+            DriveRequest {
+                runtime_owner: RuntimeOwner::Rust,
+                effect_budget: 10,
+                time_budget_ms: 10,
+                execution_mode: DriveExecutionMode::Deferred,
+                claim_owner: Some("reviewer-capacity-test".into()),
+                claimed_at_ms: 1_786_681_920_000,
+            },
+            decision_context(),
+        )
+        .unwrap();
+    assert!(waiting
+        .claimed_effects
+        .iter()
+        .all(|effect| effect.intent.effect_id != follow_up_effect.effect_id));
+
+    let released = kernel
+        .handle(blocked_reply_input(
+            "cmd-release-reviewer-capacity",
+            &review.created_ids["assignment"],
+            RoleKind::Reviewer,
+            "1786681920000-release-reviewer",
+        ))
+        .unwrap();
+    assert_eq!(released.assignment_state, Some(AssignmentState::Blocked));
+    let activated = kernel
+        .handle(succeeded_effect(
+            &follow_up_effect.effect_id,
+            "reviewer",
+            &follow_up_effect.generation,
+        ))
+        .unwrap();
+    assert_eq!(activated.assignment_state, Some(AssignmentState::Active));
 }
 
 #[test]
@@ -841,6 +917,35 @@ fn worker_completion_queues_reviewer_follow_up_behind_a_queued_review() {
         })
         .unwrap();
     assert_eq!(follow_up.data["assignment"]["state"], "queued");
+
+    let drive = kernel
+        .drive(
+            DriveRequest {
+                runtime_owner: RuntimeOwner::Rust,
+                effect_budget: 10,
+                time_budget_ms: 10,
+                execution_mode: DriveExecutionMode::Deferred,
+                claim_owner: Some("queued-review-serialization-test".into()),
+                claimed_at_ms: 1_786_681_920_000,
+            },
+            decision_context(),
+        )
+        .unwrap();
+    let claimed_reviews = drive
+        .claimed_effects
+        .iter()
+        .filter(|effect| {
+            matches!(
+                &effect.intent.intent,
+                herdr_mission::EffectIntentKind::DeliverPrompt {
+                    role,
+                    assignment_id: Some(_),
+                    ..
+                } if role.role == RoleKind::Reviewer
+            )
+        })
+        .count();
+    assert_eq!(claimed_reviews, 1);
 }
 
 #[test]
@@ -1018,7 +1123,7 @@ fn reviewer_rejected_creates_a_worker_fix_linking_back_to_the_original_work() {
 }
 
 #[test]
-fn reviewer_rejection_cannot_emit_worker_fix_while_worker_capacity_is_held() {
+fn reviewer_rejection_queues_worker_fix_while_worker_capacity_is_held() {
     let mut kernel = MissionKernel::in_memory("msn-20260814-123000-rust-kernel-abcd");
     let original_work = kernel.handle(task_input()).unwrap();
     activate(&mut kernel, &original_work, "worker");
@@ -1054,8 +1159,6 @@ fn reviewer_rejection_cannot_emit_worker_fix_while_worker_capacity_is_held() {
         ))
         .unwrap();
     activate(&mut kernel, &competing_work, "worker");
-    let before = kernel.inspect(InspectQuery::Status).unwrap();
-
     let rejection = kernel
         .handle(KernelInput {
             decision_context: DecisionContext {
@@ -1114,18 +1217,58 @@ fn reviewer_rejection_cannot_emit_worker_fix_while_worker_capacity_is_held() {
         })
         .unwrap();
 
-    assert_eq!(rejection.disposition, HandleDisposition::Rejected);
-    assert_eq!(rejection.error.unwrap().code, "role_capacity_exhausted");
-    assert!(rejection.effect_intents.is_empty());
-    let after = kernel.inspect(InspectQuery::Status).unwrap();
-    assert_eq!(after.data["revision"], before.data["revision"]);
-    assert_eq!(after.data["assignment_count"], 3);
+    assert_eq!(rejection.disposition, HandleDisposition::Applied);
+    assert_eq!(rejection.assignment_state, Some(AssignmentState::Rejected));
+    assert_eq!(rejection.effect_intents.len(), 4);
     let review_thread = kernel
         .inspect(InspectQuery::AssignmentThread {
             assignment_id: completed.created_ids["follow_up_assignment"].clone(),
         })
         .unwrap();
-    assert_eq!(review_thread.data["assignment"]["state"], "active");
+    assert_eq!(review_thread.data["assignment"]["state"], "rejected");
+    let fix_thread = kernel
+        .inspect(InspectQuery::AssignmentThread {
+            assignment_id: rejection.created_ids["follow_up_assignment"].clone(),
+        })
+        .unwrap();
+    assert_eq!(fix_thread.data["assignment"]["state"], "queued");
+
+    let fix_effect = &rejection.effect_intents[1];
+    let waiting = kernel
+        .drive(
+            DriveRequest {
+                runtime_owner: RuntimeOwner::Rust,
+                effect_budget: 10,
+                time_budget_ms: 10,
+                execution_mode: DriveExecutionMode::Deferred,
+                claim_owner: Some("worker-capacity-test".into()),
+                claimed_at_ms: 1_786_681_980_000,
+            },
+            decision_context(),
+        )
+        .unwrap();
+    assert!(waiting
+        .claimed_effects
+        .iter()
+        .all(|effect| effect.intent.effect_id != fix_effect.effect_id));
+
+    let released = kernel
+        .handle(blocked_reply_input(
+            "cmd-release-worker-capacity",
+            &competing_work.created_ids["assignment"],
+            RoleKind::Worker,
+            "1786681980000-release-worker",
+        ))
+        .unwrap();
+    assert_eq!(released.assignment_state, Some(AssignmentState::Blocked));
+    let activated = kernel
+        .handle(succeeded_effect(
+            &fix_effect.effect_id,
+            "worker",
+            &fix_effect.generation,
+        ))
+        .unwrap();
+    assert_eq!(activated.assignment_state, Some(AssignmentState::Active));
 }
 
 #[test]

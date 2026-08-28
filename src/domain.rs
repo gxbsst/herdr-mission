@@ -708,7 +708,10 @@ impl MemoryCoordinationStore {
         let candidate = self
             .effects
             .iter()
-            .find(|(effect_id, _)| !self.claimed_effects.contains_key(*effect_id))
+            .find(|(effect_id, effect)| {
+                !self.claimed_effects.contains_key(*effect_id)
+                    && !self.assignment_effect_waits_for_capacity(effect_id, effect)
+            })
             .map(|(effect_id, effect)| (effect_id.clone(), effect.clone()));
         let Some((effect_id, effect)) = candidate else {
             return Ok(None);
@@ -1371,13 +1374,6 @@ impl MemoryCoordinationStore {
                         role: RoleKind::Reviewer,
                         instance: None,
                     };
-                    if self.role_active_capacity_held(&reviewer) {
-                        return Ok(rejected_receipt(
-                            command_id,
-                            "role_capacity_exhausted",
-                            "another assignment already holds the target role capacity",
-                        ));
-                    }
                     let parent_assignment = assignment
                         .parent_id
                         .clone()
@@ -1480,13 +1476,6 @@ impl MemoryCoordinationStore {
                             role: RoleKind::Worker,
                             instance: None,
                         };
-                        if self.role_capacity_held(&worker) {
-                            return Ok(rejected_receipt(
-                                command_id,
-                                "role_capacity_exhausted",
-                                "another assignment already holds the target role capacity",
-                            ));
-                        }
                         let parent_assignment = relationships["parent_assignment"].clone();
                         let follow_up_prompt = format!("修复 Reviewer 指出的问题：{prompt}");
                         self.assignments.insert(
@@ -1544,7 +1533,7 @@ impl MemoryCoordinationStore {
                         generation: notice.generation.clone(),
                         intent: EffectIntentKind::DeliverPrompt {
                             role: notice.target.clone(),
-                            assignment_id: Some(assignment_id.to_owned()),
+                            assignment_id: None,
                             prompt: notice.prompt.clone(),
                         },
                     });
@@ -1568,7 +1557,7 @@ impl MemoryCoordinationStore {
                         notice.outbox_id.clone(),
                         PendingEffect {
                             role: notice.target.clone(),
-                            assignment_id: Some(assignment_id.to_owned()),
+                            assignment_id: None,
                             generation: notice.generation.clone(),
                             prompt: notice.prompt.clone(),
                         },
@@ -2373,17 +2362,38 @@ impl MemoryCoordinationStore {
         })
     }
 
-    /// True when the target role already has an *active* assignment (one that
-    /// has been delivered and is being worked). A merely `queued` assignment
-    /// does not block a follow-up: it is waiting for delivery, so a second
-    /// queued follow-up may line up behind it without being rejected.
-    fn role_active_capacity_held(&self, target: &crate::RoleRef) -> bool {
-        if target.role == RoleKind::Scout {
+    fn assignment_effect_waits_for_capacity(
+        &self,
+        effect_id: &str,
+        effect: &PendingEffect,
+    ) -> bool {
+        let Some(assignment_id) = effect.assignment_id.as_deref() else {
+            return false;
+        };
+        let Some(assignment) = self.assignments.get(assignment_id) else {
+            return false;
+        };
+        if assignment.target != effect.role || assignment.state != AssignmentState::Queued {
             return false;
         }
-        self.assignments.values().any(|assignment| {
-            assignment.target.role == target.role && assignment.state == AssignmentState::Active
-        })
+        let active_assignment_exists = self.assignments.iter().any(|(candidate_id, candidate)| {
+            candidate_id != assignment_id
+                && candidate.target == assignment.target
+                && candidate.state == AssignmentState::Active
+        });
+        let assignment_effect_is_in_flight = self.claimed_effects.keys().any(|claimed_effect_id| {
+            claimed_effect_id != effect_id
+                && self
+                    .effects
+                    .get(claimed_effect_id)
+                    .and_then(|claimed_effect| claimed_effect.assignment_id.as_deref())
+                    .and_then(|claimed_assignment_id| self.assignments.get(claimed_assignment_id))
+                    .is_some_and(|claimed_assignment| {
+                        claimed_assignment.target == assignment.target
+                            && claimed_assignment.state == AssignmentState::Queued
+                    })
+        });
+        active_assignment_exists || assignment_effect_is_in_flight
     }
 
     fn generation_is_stale(&self, role_identity: &str, generation: &Generation) -> bool {

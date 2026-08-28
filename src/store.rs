@@ -657,7 +657,10 @@ impl SqliteV3CoordinationStore {
             })?;
         let candidate = transaction
             .query_row(
-                "SELECT o.id, m.assignment_id, o.target_role,
+                "SELECT o.id,
+                        CASE WHEN o.target_role = 'pm' OR m.kind = 'context'
+                             THEN NULL ELSE m.assignment_id END,
+                        o.target_role,
                         r.launch_generation, m.body
                  FROM outbox o
                  JOIN messages m ON m.id = o.message_id
@@ -666,6 +669,39 @@ impl SqliteV3CoordinationStore {
                  WHERE o.mission_id = ?1 AND o.status IN ('queued', 'retry')
                    AND o.claimed_by = '' AND o.attempts < ?2
                    AND (o.claimed_at IS NULL OR o.claimed_at <= ?3)
+                   AND NOT EXISTS(
+                       SELECT 1
+                       FROM assignments queued_assignment
+                       WHERE queued_assignment.mission_id = o.mission_id
+                         AND queued_assignment.id = m.assignment_id
+                         AND queued_assignment.target_role = o.target_role
+                         AND queued_assignment.state = 'queued'
+                         AND (
+                             EXISTS(
+                                 SELECT 1
+                                 FROM assignments active_assignment
+                                 WHERE active_assignment.mission_id = queued_assignment.mission_id
+                                   AND active_assignment.target_role = queued_assignment.target_role
+                                   AND active_assignment.state = 'active'
+                                   AND active_assignment.id <> queued_assignment.id
+                             )
+                             OR EXISTS(
+                                 SELECT 1
+                                 FROM outbox in_flight_outbox
+                                 JOIN messages in_flight_message
+                                   ON in_flight_message.id = in_flight_outbox.message_id
+                                 JOIN assignments in_flight_assignment
+                                   ON in_flight_assignment.mission_id = in_flight_outbox.mission_id
+                                  AND in_flight_assignment.id = in_flight_message.assignment_id
+                                 WHERE in_flight_outbox.mission_id = o.mission_id
+                                   AND in_flight_outbox.target_role = o.target_role
+                                   AND in_flight_outbox.status = 'sending'
+                                   AND in_flight_outbox.id <> o.id
+                                   AND in_flight_assignment.target_role = o.target_role
+                                   AND in_flight_assignment.state = 'queued'
+                             )
+                         )
+                   )
                  ORDER BY o.created_at, o.id LIMIT 1",
                 rusqlite::params![mission_id, MAX_DELIVERY_ATTEMPTS, claimed_at_ms],
                 |row| {
@@ -2190,7 +2226,7 @@ fn persist_review_notices(
                 "review notice effect is not a delivery prompt",
             ));
         };
-        if assignment_id.as_deref() != Some(reviewer_assignment_id)
+        if assignment_id.is_some()
             || role_storage_identity(role)? != target_role
             || prompt != &notice_body
         {
@@ -2805,7 +2841,10 @@ fn restore_pending_effects(
 ) -> Result<(), KernelError> {
     let mut statement = transaction
         .prepare(
-            "SELECT outbox.id, messages.assignment_id, outbox.target_role,
+            "SELECT outbox.id,
+                    CASE WHEN outbox.target_role = 'pm' OR messages.kind = 'context'
+                         THEN NULL ELSE messages.assignment_id END,
+                    outbox.target_role,
                     team_roles.launch_generation, messages.body
              FROM outbox
              JOIN messages ON messages.id = outbox.message_id
@@ -2833,19 +2872,10 @@ fn restore_pending_effects(
             .map_err(|error| sqlite_error("sqlite_handle_failed", "load_pending_effects", error))?;
         let generation = crate::Generation::new(generation.clone())
             .map_err(|_| invalid_persisted_state("launch generation", generation))?;
-        // A PM-bound outbox is a reply notice, not a new assignment dispatch:
-        // it must deliver as a plain notice instead of re-activating the
-        // original assignment (which is already completed). PM is never a
-        // dispatch target, so target_role == "pm" is unambiguous.
-        let effect_assignment_id = if target_role == "pm" {
-            None
-        } else {
-            assignment_id
-        };
         reducer.restore_effect(
             effect_id,
             parse_role_storage_identity(&target_role)?,
-            effect_assignment_id,
+            assignment_id,
             generation,
             prompt,
         )?;

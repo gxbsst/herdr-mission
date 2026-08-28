@@ -13,7 +13,8 @@ use herdr_mission::{
     create_mission, default_codex_team, kernel_deliver, kernel_dispatch_command,
     kernel_read_context, kernel_reconcile, kernel_reply_command, read_role_context,
     reconcile_role_healths, record_role_runtime, AgentSnapshot, AgentStatus, CreateMissionRequest,
-    InspectQuery, LaunchMode, MissionKernel, ProcessOutput, ProcessRunner,
+    DecisionContext, DriveExecutionMode, DriveRequest, InspectQuery, LaunchMode, MissionKernel,
+    ProcessOutput, ProcessRunner, RuntimeOwner,
 };
 use rusqlite::Connection;
 
@@ -745,6 +746,350 @@ fn kernel_reply_completes_active_assignment() {
         )
         .unwrap();
     assert_eq!(state, "completed");
+
+    cleanup(&path);
+}
+
+#[test]
+fn queued_reviewer_follow_up_waits_for_active_capacity_before_delivery() {
+    let path = temp_db("reviewer-follow-up-capacity");
+    let mission_id = "msn-kernel-reviewer-follow-up-capacity";
+    create_mission(&path, &request(mission_id)).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    for (role, terminal_id) in [
+        ("pm", "mission-x-pm"),
+        ("worker", "mission-x-worker"),
+        ("reviewer", "mission-x-reviewer"),
+    ] {
+        connection
+            .execute(
+                "UPDATE team_roles SET terminal_id = ?1 WHERE mission_id = ?2 AND role = ?3",
+                rusqlite::params![terminal_id, mission_id, role],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    kernel_dispatch_command(
+        &path,
+        mission_id,
+        "pm",
+        "reviewer",
+        "review",
+        "review the other work",
+    )
+    .unwrap();
+    let held_review = kernel_read_context(&path, mission_id, "reviewer")
+        .unwrap()
+        .pending_assignments[0]
+        .id
+        .clone();
+    let runner = FakeRunner {
+        calls: RefCell::new(Vec::new()),
+    };
+    kernel_deliver(&path, &runner, "herdr").unwrap();
+
+    let worker = kernel_dispatch_command(
+        &path,
+        mission_id,
+        "pm",
+        "worker",
+        "task",
+        "complete while reviewer is busy",
+    )
+    .unwrap()
+    .assignment_id
+    .unwrap();
+    kernel_deliver(&path, &runner, "herdr").unwrap();
+    runner.calls.borrow_mut().clear();
+
+    let completed = kernel_reply_command(
+        &path,
+        mission_id,
+        "worker",
+        &worker,
+        "completed",
+        "ready for review",
+    )
+    .unwrap();
+    assert_eq!(completed.assignment_state.as_deref(), Some("completed"));
+    let reviewer_context = kernel_read_context(&path, mission_id, "reviewer").unwrap();
+    let queued_review = reviewer_context
+        .pending_assignments
+        .iter()
+        .find(|assignment| assignment.state == "queued")
+        .expect("automatic reviewer follow-up must be persisted as queued")
+        .id
+        .clone();
+
+    let waiting_report = kernel_deliver(&path, &runner, "herdr").unwrap();
+    assert_eq!(waiting_report.delivered, 1);
+    assert_eq!(runner.calls.borrow().len(), 1);
+    assert!(!runner.calls.borrow()[0]
+        .1
+        .iter()
+        .any(|argument| argument == "mission-x-reviewer"));
+    let connection = Connection::open(&path).unwrap();
+    let waiting_outbox: (String, i64) = connection
+        .query_row(
+            "SELECT outbox.status, outbox.attempts
+             FROM outbox JOIN messages ON messages.id = outbox.message_id
+             WHERE messages.assignment_id = ?1 AND messages.kind = 'review'",
+            [&queued_review],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(waiting_outbox, ("queued".into(), 0));
+    drop(connection);
+
+    kernel_reply_command(
+        &path,
+        mission_id,
+        "reviewer",
+        &held_review,
+        "blocked",
+        "capacity released",
+    )
+    .unwrap();
+    runner.calls.borrow_mut().clear();
+
+    let resumed_report = kernel_deliver(&path, &runner, "herdr").unwrap();
+    assert_eq!(resumed_report.delivered, 2);
+    assert_eq!(runner.calls.borrow().len(), 2);
+    let reviewer_context = kernel_read_context(&path, mission_id, "reviewer").unwrap();
+    let resumed_review = reviewer_context
+        .pending_assignments
+        .iter()
+        .find(|assignment| assignment.id == queued_review)
+        .expect("queued reviewer follow-up must survive reopen and resume");
+    assert_eq!(resumed_review.state, "active");
+
+    cleanup(&path);
+}
+
+#[test]
+fn queued_worker_fix_waits_for_active_capacity_before_delivery() {
+    let path = temp_db("worker-fix-capacity");
+    let mission_id = "msn-kernel-worker-fix-capacity";
+    create_mission(&path, &request(mission_id)).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    for (role, terminal_id) in [
+        ("pm", "mission-x-pm"),
+        ("worker", "mission-x-worker"),
+        ("reviewer", "mission-x-reviewer"),
+    ] {
+        connection
+            .execute(
+                "UPDATE team_roles SET terminal_id = ?1 WHERE mission_id = ?2 AND role = ?3",
+                rusqlite::params![terminal_id, mission_id, role],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let original_work = kernel_dispatch_command(
+        &path,
+        mission_id,
+        "pm",
+        "worker",
+        "task",
+        "work that will need review",
+    )
+    .unwrap()
+    .assignment_id
+    .unwrap();
+    let runner = FakeRunner {
+        calls: RefCell::new(Vec::new()),
+    };
+    kernel_deliver(&path, &runner, "herdr").unwrap();
+    kernel_reply_command(
+        &path,
+        mission_id,
+        "worker",
+        &original_work,
+        "completed",
+        "ready for review",
+    )
+    .unwrap();
+    kernel_deliver(&path, &runner, "herdr").unwrap();
+    let review_assignment = kernel_read_context(&path, mission_id, "reviewer")
+        .unwrap()
+        .pending_assignments
+        .into_iter()
+        .find(|assignment| assignment.state == "active")
+        .expect("automatic review must be active")
+        .id;
+
+    let competing_work = kernel_dispatch_command(
+        &path,
+        mission_id,
+        "pm",
+        "worker",
+        "task",
+        "work that holds worker capacity",
+    )
+    .unwrap()
+    .assignment_id
+    .unwrap();
+    kernel_deliver(&path, &runner, "herdr").unwrap();
+    runner.calls.borrow_mut().clear();
+
+    let rejected = kernel_reply_command(
+        &path,
+        mission_id,
+        "reviewer",
+        &review_assignment,
+        "rejected",
+        "one focused correction is required",
+    )
+    .unwrap();
+    assert_eq!(rejected.assignment_state.as_deref(), Some("rejected"));
+    let worker_context = kernel_read_context(&path, mission_id, "worker").unwrap();
+    let queued_fix = worker_context
+        .pending_assignments
+        .iter()
+        .find(|assignment| assignment.state == "queued")
+        .expect("automatic Worker fix must be persisted as queued")
+        .id
+        .clone();
+
+    let waiting_report = kernel_deliver(&path, &runner, "herdr").unwrap();
+    assert_eq!(waiting_report.delivered, 3);
+    assert_eq!(runner.calls.borrow().len(), 3);
+    assert!(runner.calls.borrow().iter().all(|(_, arguments)| {
+        arguments
+            .iter()
+            .all(|argument| !argument.contains("修复 Reviewer 指出的问题"))
+    }));
+    let connection = Connection::open(&path).unwrap();
+    let waiting_outbox: (String, i64) = connection
+        .query_row(
+            "SELECT outbox.status, outbox.attempts
+             FROM outbox JOIN messages ON messages.id = outbox.message_id
+             WHERE messages.assignment_id = ?1 AND messages.kind = 'fix'",
+            [&queued_fix],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(waiting_outbox, ("queued".into(), 0));
+    drop(connection);
+
+    kernel_reply_command(
+        &path,
+        mission_id,
+        "worker",
+        &competing_work,
+        "blocked",
+        "capacity released",
+    )
+    .unwrap();
+    runner.calls.borrow_mut().clear();
+
+    let resumed_report = kernel_deliver(&path, &runner, "herdr").unwrap();
+    assert_eq!(resumed_report.delivered, 2);
+    assert_eq!(runner.calls.borrow().len(), 2);
+    let worker_context = kernel_read_context(&path, mission_id, "worker").unwrap();
+    let resumed_fix = worker_context
+        .pending_assignments
+        .iter()
+        .find(|assignment| assignment.id == queued_fix)
+        .expect("queued Worker fix must survive reopen and resume");
+    assert_eq!(resumed_fix.state, "active");
+
+    cleanup(&path);
+}
+
+#[test]
+fn deferred_drive_claims_only_one_queued_singleton_assignment() {
+    let path = temp_db("queued-singleton-serialization");
+    let mission_id = "msn-kernel-queued-singleton-serialization";
+    create_mission(&path, &request(mission_id)).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    for (role, terminal_id) in [
+        ("worker", "mission-x-worker"),
+        ("reviewer", "mission-x-reviewer"),
+    ] {
+        connection
+            .execute(
+                "UPDATE team_roles SET terminal_id = ?1 WHERE mission_id = ?2 AND role = ?3",
+                rusqlite::params![terminal_id, mission_id, role],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let worker = kernel_dispatch_command(
+        &path,
+        mission_id,
+        "pm",
+        "worker",
+        "task",
+        "complete after a review is already queued",
+    )
+    .unwrap()
+    .assignment_id
+    .unwrap();
+    let runner = FakeRunner {
+        calls: RefCell::new(Vec::new()),
+    };
+    kernel_deliver(&path, &runner, "herdr").unwrap();
+    kernel_dispatch_command(
+        &path,
+        mission_id,
+        "pm",
+        "reviewer",
+        "review",
+        "first queued review",
+    )
+    .unwrap();
+    kernel_reply_command(
+        &path,
+        mission_id,
+        "worker",
+        &worker,
+        "completed",
+        "second queued review",
+    )
+    .unwrap();
+
+    let mut kernel =
+        MissionKernel::open_writable_sqlite_v3(mission_id, &path, Duration::from_millis(25))
+            .unwrap();
+    let drive = kernel
+        .drive(
+            DriveRequest {
+                runtime_owner: RuntimeOwner::Rust,
+                effect_budget: 10,
+                time_budget_ms: 10,
+                execution_mode: DriveExecutionMode::Deferred,
+                claim_owner: Some("queued-singleton-serialization-test".into()),
+                claimed_at_ms: i64::MAX,
+            },
+            DecisionContext {
+                observed_at: "2026-08-28T00:00:00Z".into(),
+                allocated_ids: Default::default(),
+                generations: Default::default(),
+            },
+        )
+        .unwrap();
+    let claimed_reviews = drive
+        .claimed_effects
+        .iter()
+        .filter(|effect| {
+            matches!(
+                &effect.intent.intent,
+                herdr_mission::EffectIntentKind::DeliverPrompt {
+                    role,
+                    assignment_id: Some(_),
+                    ..
+                } if role.role == herdr_mission::RoleKind::Reviewer
+            )
+        })
+        .count();
+    assert_eq!(claimed_reviews, 1);
 
     cleanup(&path);
 }
