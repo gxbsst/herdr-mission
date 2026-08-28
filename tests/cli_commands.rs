@@ -1,4 +1,6 @@
 use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
@@ -308,6 +310,65 @@ fn status_reads_back_new_mission() {
     assert_eq!(status["roles"]["pm"], "unknown");
 
     cleanup(&path);
+}
+
+#[test]
+fn reconcile_reports_health_and_delivery_results_as_structured_json() {
+    let path = temp_db_path("reconcile");
+    let fake_herdr = path.with_extension("herdr");
+    fs::write(
+        &fake_herdr,
+        "#!/bin/sh\nif [ \"$1\" = agent ] && [ \"$2\" = list ]; then\n  printf '%s\\n' '{\"result\":{\"agents\":[{\"name\":\"mission-pm\",\"pane_id\":\"w16:p1\",\"agent_status\":\"working\"}]}}'\n  exit 0\nfi\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_herdr).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_herdr, permissions).unwrap();
+
+    let created = Command::new(kernel_binary())
+        .args(["new", "--json", "--no-start", "--title=Reconcile Mission"])
+        .arg(format!("--database={}", path.display()))
+        .output()
+        .unwrap();
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let mission_id = created["mission_id"].as_str().unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles
+             SET pane_id = 'w16:p1', terminal_id = 'mission-pm', health = 'idle'
+             WHERE mission_id = ?1 AND role = 'pm'",
+            [mission_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = Command::new(kernel_binary())
+        .args(["reconcile", "--json"])
+        .arg(format!("--database={}", path.display()))
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["health"]["status"], "ok");
+    assert_eq!(value["health"]["matched"], 1);
+    assert_eq!(value["health"]["updated"], 1);
+    assert_eq!(value["delivery"]["status"], "ok");
+
+    let connection = Connection::open(&path).unwrap();
+    let health: String = connection
+        .query_row(
+            "SELECT health FROM team_roles WHERE mission_id = ?1 AND role = 'pm'",
+            [mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(health, "working");
+
+    cleanup(&path);
+    let _ = fs::remove_file(fake_herdr);
 }
 
 #[test]

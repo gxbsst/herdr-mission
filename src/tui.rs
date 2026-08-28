@@ -7,14 +7,17 @@
 //! resume / dispatch / deliver / doctor); the Python single-agent review,
 //! verify, archive, and evidence lifecycle is intentionally out of scope.
 
-use std::{path::Path, sync::mpsc, time::Duration};
+use std::{io::Write, path::Path, sync::mpsc, time::Duration};
 
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::{
+        event::{self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+        execute,
+    },
     layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Padding, Paragraph, Row, Table, TableState},
+    widgets::{Block, Cell, Padding, Paragraph, Row, Table, TableState, Wrap},
     DefaultTerminal, Frame,
 };
 use throbber_widgets_tui::{Throbber, ThrobberState};
@@ -65,9 +68,18 @@ pub fn run_tui(database: &Path) -> Result<(), String> {
 
     let mut app = App::new(database)?;
     let mut terminal = ratatui::try_init().map_err(|error| format!("terminal init: {error}"))?;
+    let mut output = std::io::stdout();
+    if let Err(error) = enable_native_text_selection(&mut output) {
+        ratatui::restore();
+        return Err(format!("terminal mouse setup: {error}"));
+    }
     let result = app.run(&mut terminal);
     ratatui::restore();
     result
+}
+
+fn enable_native_text_selection(output: &mut impl Write) -> std::io::Result<()> {
+    execute!(output, DisableMouseCapture)
 }
 
 enum View {
@@ -678,15 +690,17 @@ impl App {
     }
 
     fn render_list_view(&mut self, frame: &mut Frame, area: Rect) {
-        if area.width >= 96 {
+        if area.width >= 136 {
             let chunks =
-                Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
+                Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
                     .spacing(2)
                     .split(area);
             self.render_list(frame, chunks[0]);
             self.render_detail(frame, chunks[1]);
         } else {
-            let chunks = Layout::vertical([Constraint::Min(5), Constraint::Length(10)])
+            let desired_detail = if area.width < 72 { 15 } else { 14 };
+            let detail_height = desired_detail.min(area.height.saturating_sub(3));
+            let chunks = Layout::vertical([Constraint::Min(2), Constraint::Length(detail_height)])
                 .spacing(1)
                 .split(area);
             self.render_list(frame, chunks[0]);
@@ -777,47 +791,113 @@ impl App {
             return;
         };
 
-        let stage = stage_color(&mission.stage);
-        let mut lines: Vec<Line> = vec![
+        let stage_color = stage_color(&mission.stage);
+        let detail_height = if area.width < 72 { 7 } else { 6 };
+        let chunks = Layout::vertical([Constraint::Length(detail_height), Constraint::Min(5)])
+            .spacing(1)
+            .split(area);
+        let label = Style::default().fg(Color::DarkGray);
+        let metadata = vec![
             Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(stage)),
+                Span::styled("名称       ", label),
                 Span::styled(
                     mission.brief.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled(stage_label(&mission.stage), Style::default().fg(stage)),
+                Span::styled("Mission ID ", label),
+                Span::raw(mission.mission_id.clone()),
+            ]),
+            Line::from(vec![
+                Span::styled("状态       ", label),
                 Span::styled(
-                    format!(
-                        "  ·  {}  ·  {}  ·  pending {}  ·  generation {}",
-                        profile_short(&mission.agent_profile_id),
-                        mission.launch_mode.as_str(),
-                        mission.pending_assignments,
-                        mission.generation,
-                    ),
-                    Style::default().fg(Color::DarkGray),
+                    stage_label(&mission.stage).to_string(),
+                    Style::default().fg(stage_color),
                 ),
+                Span::styled("   启动模式 ", label),
+                Span::raw(mission.launch_mode.as_str()),
+                Span::styled("   未结束任务 ", label),
+                Span::raw(mission.pending_assignments.to_string()),
+            ]),
+            Line::from(vec![
+                Span::styled("Profile    ", label),
+                Span::raw(profile_short(&mission.agent_profile_id)),
+                Span::styled("   Generation ", label),
+                Span::raw(mission.generation.to_string()),
+                Span::styled("   创建 ", label),
+                Span::raw(short_time(&mission.created_at)),
             ]),
         ];
-        if mission.roles.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "尚无角色配置。",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            for role in &mission.roles {
-                lines.push(Line::from(role_spans(role)));
-            }
-        }
         frame.render_widget(
-            Paragraph::new(lines).block(
-                box_block()
-                    .title(" 当前选择 ")
-                    .border_style(Style::default().fg(stage)),
+            Paragraph::new(metadata).wrap(Wrap { trim: false }).block(
+                detail_block()
+                    .title(" Mission 详情 ")
+                    .border_style(Style::default().fg(stage_color)),
             ),
-            area,
+            chunks[0],
         );
+
+        self.render_role_table(frame, chunks[1], mission);
+    }
+
+    fn render_role_table(&self, frame: &mut Frame, area: Rect, mission: &MissionOverview) {
+        let wide = area.width >= 88;
+        let header_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD);
+        let rows = mission.roles.iter().map(|role| {
+            let (glyph, color) = health_glyph(&role.health);
+            let state = Cell::from(Line::from(vec![
+                Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                Span::styled(
+                    health_label(&role.health).to_string(),
+                    Style::default().fg(color),
+                ),
+            ]));
+            let role_name = Cell::from(role_short_label(&role.role).to_string());
+            let agent = Cell::from(value_or_dash(&role.agent_name));
+            let pane = Cell::from(value_or_dash(&role.pane_id));
+            if wide {
+                Row::new(vec![
+                    state,
+                    role_name,
+                    Cell::from(provider_model(role)),
+                    agent,
+                    pane,
+                ])
+            } else {
+                Row::new(vec![state, role_name, agent, pane])
+            }
+        });
+
+        let (header, widths) = if wide {
+            (
+                Row::new(["状态", "角色", "Provider / Model", "Agent", "Pane"]).style(header_style),
+                vec![
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Length(18),
+                    Constraint::Min(18),
+                    Constraint::Length(12),
+                ],
+            )
+        } else {
+            (
+                Row::new(["状态", "角色", "Agent", "Pane"]).style(header_style),
+                vec![
+                    Constraint::Length(8),
+                    Constraint::Length(8),
+                    Constraint::Min(20),
+                    Constraint::Length(8),
+                ],
+            )
+        };
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(detail_block().title(" 角色 "))
+            .column_spacing(1);
+        frame.render_widget(table, area);
     }
 
     fn render_new(&self, frame: &mut Frame, area: Rect) {
@@ -1010,6 +1090,10 @@ fn box_block() -> Block<'static> {
     Block::bordered().padding(Padding::new(1, 1, 1, 1))
 }
 
+fn detail_block() -> Block<'static> {
+    Block::bordered().padding(Padding::new(1, 1, 0, 0))
+}
+
 fn form_field_cycle(layout: MissionLayout, source: WorkspaceSource) -> &'static [FormField] {
     match (layout, source) {
         (MissionLayout::Team, WorkspaceSource::Import) => &[
@@ -1136,8 +1220,10 @@ fn is_active_stage(stage: &str) -> bool {
 
 fn health_label(health: &str) -> &str {
     match health {
-        "running" => "运行中",
+        "working" | "running" => "运行中",
         "idle" => "空闲",
+        "blocked" => "阻塞",
+        "done" => "已完成",
         "restorable" => "可恢复",
         "exited" => "已退出",
         "missing" => "缺失",
@@ -1180,7 +1266,10 @@ fn role_health_cell(roles: &[RoleOverview]) -> (String, Color) {
         return ("-".to_string(), Color::DarkGray);
     }
     let total = roles.len();
-    let running = roles.iter().filter(|role| role.health == "running").count();
+    let running = roles
+        .iter()
+        .filter(|role| matches!(role.health.as_str(), "working" | "running"))
+        .count();
     let broken = roles
         .iter()
         .filter(|role| matches!(role.health.as_str(), "missing" | "blocked"))
@@ -1199,8 +1288,10 @@ fn role_health_cell(roles: &[RoleOverview]) -> (String, Color) {
 
 fn health_glyph(health: &str) -> (&'static str, Color) {
     match health {
-        "running" => ("●", Color::Green),
+        "working" | "running" => ("●", Color::Green),
         "idle" => ("○", Color::DarkGray),
+        "blocked" => ("!", Color::Red),
+        "done" => ("✓", Color::Green),
         "restorable" => ("◐", Color::Yellow),
         "exited" => ("◌", Color::DarkGray),
         "missing" => ("✕", Color::Red),
@@ -1210,31 +1301,20 @@ fn health_glyph(health: &str) -> (&'static str, Color) {
     }
 }
 
-fn role_spans(role: &RoleOverview) -> Vec<Span<'static>> {
-    let (glyph, color) = health_glyph(&role.health);
-    let provider_model = if role.model.is_empty() {
+fn provider_model(role: &RoleOverview) -> String {
+    if role.model.is_empty() {
         role.provider.clone()
     } else {
         format!("{}/{}", role.provider, role.model)
-    };
-    let agent = if role.agent_name.is_empty() {
-        String::new()
+    }
+}
+
+fn value_or_dash(value: &str) -> String {
+    if value.is_empty() {
+        "-".to_string()
     } else {
-        format!("  {}", role.agent_name)
-    };
-    vec![
-        Span::styled(glyph.to_string(), Style::default().fg(color)),
-        Span::raw(format!(" {:<9}", role_short_label(&role.role))),
-        Span::styled(
-            format!("{provider_model:<12}"),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            health_label(&role.health).to_string(),
-            Style::default().fg(color),
-        ),
-        Span::styled(agent, Style::default().fg(Color::DarkGray)),
-    ]
+        value.to_string()
+    }
 }
 
 fn mission_search_text(mission: &MissionOverview) -> String {
@@ -1259,11 +1339,49 @@ fn mission_search_text(mission: &MissionOverview) -> String {
 }
 
 fn error_line(error: &KernelError) -> String {
-    if error.code.is_empty() {
+    let base = if error.code.is_empty() {
         error.message.clone()
     } else {
         format!("{} ({})", error.message, error.code)
+    };
+    let operation = error
+        .details
+        .get("operation")
+        .and_then(|value| value.as_str());
+    let reason = error
+        .details
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            error
+                .details
+                .get("stderr")
+                .and_then(|value| value.as_str())
+                .and_then(structured_error_message)
+        });
+    match (operation, reason) {
+        (Some(operation), Some(reason)) => format!("{base} · {operation}: {reason}"),
+        (Some(operation), None) => format!("{base} · {operation}"),
+        (None, Some(reason)) => format!("{base} · {reason}"),
+        (None, None) => base,
     }
+}
+
+fn structured_error_message(raw: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
 }
 
 fn launch_options(
@@ -1398,6 +1516,7 @@ fn build_new_mission_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
 
     fn role(role: &str, health: &str) -> RoleOverview {
         RoleOverview {
@@ -1656,5 +1775,159 @@ mod tests {
             LaunchMode::Auto,
         );
         assert_eq!(request.launch_mode, LaunchMode::Auto);
+    }
+
+    #[test]
+    fn error_line_includes_operation_and_structured_herdr_reason() {
+        let error = KernelError {
+            category: crate::ErrorCategory::Infrastructure,
+            code: "mission_region_unavailable".into(),
+            message: "Mission region is unavailable in the current Herdr session".into(),
+            retryable: false,
+            details: std::collections::BTreeMap::from([
+                ("operation".into(), serde_json::json!("tab get")),
+                (
+                    "stderr".into(),
+                    serde_json::json!(
+                        r#"{"error":{"code":"tab_not_found","message":"tab w78:t1 not found"}}"#
+                    ),
+                ),
+            ]),
+        };
+
+        let line = error_line(&error);
+        assert!(line.contains("mission_region_unavailable"), "{line}");
+        assert!(line.contains("tab get"), "{line}");
+        assert!(line.contains("tab w78:t1 not found"), "{line}");
+    }
+
+    #[test]
+    fn live_role_healths_have_explicit_labels_glyphs_and_running_counts() {
+        assert_eq!(health_label("working"), "运行中");
+        assert_eq!(health_label("blocked"), "阻塞");
+        assert_eq!(health_label("done"), "已完成");
+        assert_eq!(health_label("missing"), "缺失");
+        assert_eq!(health_glyph("working").0, "●");
+        assert_eq!(health_glyph("blocked").0, "!");
+        assert_eq!(health_glyph("done").0, "✓");
+        assert_eq!(health_glyph("missing").0, "✕");
+
+        let (summary, _) = role_health_cell(&[
+            role("pm", "working"),
+            role("worker", "running"),
+            role("reviewer", "idle"),
+        ]);
+        assert_eq!(summary, "2/3 运行");
+    }
+
+    #[test]
+    fn selected_mission_renders_separate_metadata_and_role_table_regions() {
+        let mission_id = "msn-20260827-082057-rust-version-0b801f50";
+        let mut mission = overview(
+            mission_id,
+            "rust-version",
+            "active",
+            vec![role("reviewer", "working")],
+        );
+        mission.pending_assignments = 1;
+        mission.roles[0].agent_name = "mission-rust-version-reviewer".into();
+        mission.roles[0].pane_id = "w16:p6".into();
+        let app = make_app(vec![mission], "");
+
+        let rendered = render_detail_text(&app, 88, 16);
+        assert!(rendered.contains("Mission 详 情"), "{rendered}");
+        assert!(rendered.contains(mission_id));
+        assert!(rendered.contains("角 色"));
+        assert!(rendered.contains("状 态"), "{rendered}");
+        assert!(rendered.contains("Provider / Model"));
+        assert!(rendered.contains("Agent"));
+        assert!(rendered.contains("Pane"));
+        assert!(rendered.contains("mission-rust-version-reviewer"));
+        assert!(rendered.contains("w16:p6"));
+    }
+
+    #[test]
+    fn compact_role_table_keeps_status_role_agent_and_pane_headers() {
+        let mut mission = overview(
+            "msn-20260827-082057-rust-version-0b801f50",
+            "rust-version",
+            "active",
+            vec![role("reviewer", "working")],
+        );
+        mission.roles[0].agent_name = "mission-rust-version-reviewer".into();
+        mission.roles[0].pane_id = "w16:p6".into();
+        let app = make_app(vec![mission], "");
+
+        let rendered = render_detail_text(&app, 60, 16);
+        assert!(rendered.contains("状 态"), "{rendered}");
+        assert!(rendered.contains("角 色"));
+        assert!(rendered.contains("Agent"));
+        assert!(rendered.contains("Pane"));
+        assert!(!rendered.contains("Provider / Model"));
+        assert!(rendered.contains("mission-rust-version-reviewer"));
+        assert!(rendered.contains("w16:p6"));
+    }
+
+    #[test]
+    fn full_dashboard_at_96_by_24_keeps_complete_metadata_and_all_roles() {
+        let mission_id = "msn-20260827-082057-rust-version-0b801f50";
+        let mut roles = vec![
+            role("pm", "idle"),
+            role("worker", "idle"),
+            role("scout", "idle"),
+            role("reviewer", "working"),
+        ];
+        for (index, role) in roles.iter_mut().enumerate() {
+            role.agent_name = format!("mission-rust-version-{}", role.role);
+            role.pane_id = format!("w16:p{}", index + 1);
+        }
+        let mut mission = overview(mission_id, "rust-version", "active", roles);
+        mission.pending_assignments = 1;
+        let mut app = make_app(vec![mission], "");
+
+        let rendered = render_app_text(&mut app, 96, 24);
+        assert!(rendered.contains(mission_id), "{rendered}");
+        assert!(rendered.contains("Generation"), "{rendered}");
+        assert!(rendered.contains("PM"), "{rendered}");
+        assert!(rendered.contains("Worker"), "{rendered}");
+        assert!(rendered.contains("Scout"), "{rendered}");
+        assert!(rendered.contains("Reviewer"), "{rendered}");
+    }
+
+    #[test]
+    fn native_text_selection_disables_terminal_mouse_capture() {
+        let mut output = Vec::new();
+        enable_native_text_selection(&mut output).unwrap();
+        let escape = String::from_utf8(output).unwrap();
+        assert!(escape.contains("?1000l"));
+        assert!(escape.contains("?1002l"));
+        assert!(escape.contains("?1003l"));
+        assert!(escape.contains("?1006l"));
+    }
+
+    fn render_detail_text(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let frame = terminal
+            .draw(|frame| app.render_detail(frame, frame.area()))
+            .unwrap();
+        frame
+            .buffer
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn render_app_text(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let frame = terminal.draw(|frame| app.render(frame)).unwrap();
+        frame
+            .buffer
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

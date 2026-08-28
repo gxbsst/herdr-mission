@@ -34,3 +34,12 @@
 - [ ] 5.2 验证 GitHub Release 包含三平台预编译二进制、`SHA256SUMS` 和 `COMMIT`
 - [ ] 5.3 在 `sqbair` 更新 Codex integration 并从 GitHub 安装 `v0.1.2` 预编译插件
 - [ ] 5.4 在 `sqbair` 验证 version、source、SHA、doctor，并恢复 `rust-version` Mission
+
+## 6. 历史恢复数据与诊断
+
+- [x] 6.1 为已知 `mission_workspace` 字段错位及近似但不安全的形状增加 bootstrap 回归测试
+- [x] 6.2 实现幂等原子修复，并确保不满足完整指纹的数据不被修改
+- [x] 6.3 在启动副作用前预检当前 Herdr session，并将 `workspace_not_found`/`tab_not_found` 转换为明确、不可重试的 workspace/区域错误
+- [x] 6.4 在 dashboard 状态行展示 operation 与解析后的底层错误，并保留完整日志
+- [x] 6.5 运行格式化、Clippy、完整测试、release build 和 OpenSpec strict 验证
+- [x] 6.6 备份本机状态库，运行 migration 并验证 `X战队` workspace 字段恢复且 doctor 通过

@@ -58,6 +58,22 @@
 - **WHEN** 区域 ID 为空且 workspace 中存在多个同名固定区域
 - **THEN** 系统失败关闭并报告候选 tab ID，不继续创建更多区域
 
+#### Scenario: 修复已知历史字段错位
+- **WHEN** worktree/import Mission 的真实路径字段为空，且 `review_tab_id`、`verification_tab_id` 精确呈现已知的绝对路径与 branch 错位形状
+- **THEN** bootstrap 在同一事务中恢复 `worktree_path` 与 `branch`，清空错误区域 ID，并允许固定区域发现逻辑继续恢复
+
+#### Scenario: 未知 workspace 损坏形状
+- **WHEN** 持久化 workspace 不满足完整的已知错位指纹
+- **THEN** 系统不得猜测或自动改写该行
+
+#### Scenario: Mission 区域不属于当前 Herdr session
+- **WHEN** 当前 Herdr session 对持久化 workspace 返回结构化 `workspace_not_found`
+- **THEN** 系统在任何区域或 Agent 启动副作用前返回不可重试的 `mission_workspace_unavailable`，报告预期 workspace 和底层 Herdr 错误，不跨 session 搜索或重建区域
+
+#### Scenario: 当前 workspace 中缺少持久化区域
+- **WHEN** workspace 预检通过但持久化 tab 返回结构化 `tab_not_found`
+- **THEN** 系统返回不可重试的 `mission_region_unavailable`，报告预期 workspace、tab、区域名称和底层 Herdr 错误
+
 #### Scenario: 区域工具命令启动失败
 - **WHEN** `审查` 或 `验证` 区域已创建，但配置的工具命令无法启动
 - **THEN** 系统保留该固定区域的可用 shell 并报告警告，不删除或重复创建区域

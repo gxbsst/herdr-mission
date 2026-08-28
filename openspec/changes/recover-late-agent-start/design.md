@@ -14,13 +14,15 @@ Mission 同时维护执行、审查、验证三个区域。现有默认执行区
 - 接管前同时验证 pane ID、Agent provider、Mission worktree cwd 和区域 tab，避免把无关进程错误归属到 Mission。
 - 将三个区域的精确名称固定为 `工作区`、`审查`、`验证`，并确保所有 Agent 仅在 `工作区` 启动或恢复。
 - 保持启动和恢复幂等，不重复创建 Agent 或区域 tab。
+- 自动修复已知且可无歧义识别的历史 workspace 字段错位，并让跨 Herdr session 的恢复失败可诊断。
 
 **Non-Goals:**
 
 - 不延长 Herdr Core 的通用 Agent 启动超时。
 - 不从终端文本、提示符或进程标题猜测 Agent 身份。
 - 不自动接管 provider、cwd 或 tab 不匹配的 pane。
-- 不修改 Mission SQLite schema 或迁移现有 Mission 数据。
+- 不新增或修改 Mission SQLite schema。
+- 不猜测无法唯一识别的损坏 workspace 数据，也不跨 Herdr session 搜索或接管同 ID 区域。
 
 ## Decisions
 
@@ -67,6 +69,14 @@ split 或选择 root pane 后，先把 `pane_id` 与空的稳定名称写入现�
 
 `start-role` 在创建新 pane 前读取 anchor pane 及其 tab 的结构化状态，并验证 pane ID、workspace、Mission worktree cwd、execution tab ID 和 `工作区` 名称。只有验证全部通过后才允许 split。这样 PM 不能误用 `审查`、`验证` 或其他 workspace 中的 pane 启动角色，且 split、prompt 和启动恢复始终使用持久化的 Mission worktree。
 
+### 6. 精确修复历史字段错位并保留 session 边界
+
+旧的手工数据迁移可能把 `worktree_path`、`branch` 依次写入 `review_tab_id`、`verification_tab_id`，同时把真正的路径字段留空。bootstrap 只在以下条件全部满足时原子修复：workspace 来源为 worktree/import、执行区域等于旧 `tab_id` 且形状合法、真实路径与 branch 为空、`review_tab_id` 是绝对路径、`verification_tab_id` 非空且不是 tab ID。修复将路径和 branch 放回原字段，并清空两个错误区域 ID；随后现有固定区域发现逻辑会在正确 Herdr workspace 中复用或创建 `审查`、`验证`。
+
+不满足完整指纹的数据保持原样，避免把用户合法区域或未知损坏状态静默改写。修复不增加 schema，也不依赖已废弃的回退数据库。
+
+恢复已持久化 workspace 时，runtime 先以结构化 `tab list --workspace` 做无副作用预检。当前 Herdr session 返回 `workspace_not_found` 时，系统在任何 rename/create/split/start 之前返回不可重试的 `mission_workspace_unavailable`。workspace 存在但区域 tab 返回 `tab_not_found` 时，系统返回 `mission_region_unavailable`。两类错误都包含预期身份、operation 和底层 Herdr 错误；系统不会扫描其他 session 或自动重建 workspace。dashboard 将 operation 和底层原因一起显示，因此隔离测试 session 会明确报告身份边界，而不是伪装成启动超时。
+
 ## Risks / Trade-offs
 
 - [Herdr `pane get` JSON 字段随版本变化] -> parser 只接受已知结构化字段并对缺失字段失败关闭；用 fixture 测试兼容字段。
@@ -81,15 +91,19 @@ split 或选择 root pane 后，先把 `pane_id` 与空的稳定名称写入现�
 - [区域工具命令启动失败] -> 保留固定区域 shell 并告警；不重复创建区域，也不把工具副作用当作 Agent 启动前提。
 - [接管后 rename 失败] -> 不持久化成功，Mission 继续 blocked，避免产生无法通过稳定名称访问的半成功状态。
 - [额外一次结构化查询增加失败路径延迟] -> 仅在 timeout 或 pane busy 时触发，正常启动路径无额外调用。
+- [自动修复误判合法数据] -> 仅匹配完整的已知错位指纹；任一条件不满足都不写入。
+- [跨 session 自动接管错误 workspace] -> 不跨 session 搜索；先用 workspace 结构化预检，在任何启动副作用前明确失败关闭。
+- [dashboard 隐藏底层失败] -> 在单行状态中展示 operation 与解析后的 Herdr error message，完整结构化错误仍写入日志。
 
 ## Migration Plan
 
 1. 先增加失败复现和三区域命名测试。
 2. 实现结构化 pane 状态解析、接管判断和初始 tab rename。
 3. 完成格式化、Clippy、测试和 release build。
-4. 将插件版本提升为 `0.1.2`，提交并推送 `master` 和不可变 tag `v0.1.2`。
-5. 等待现有 GitHub Actions 生成三平台二进制、`SHA256SUMS` 和 `COMMIT`。
-6. 在 `sqbair` 通过 `herdr plugin install gxbsst/herdr-mission --yes` 安装预编译 release，并恢复现有 `rust-version` Mission。
+4. 备份本机状态库后运行 bootstrap，确认已知字段错位被原子修复且重复执行幂等。
+5. 将插件版本提升为 `0.1.2`，提交并推送 `master` 和不可变 tag `v0.1.2`。
+6. 等待现有 GitHub Actions 生成三平台二进制、`SHA256SUMS` 和 `COMMIT`。
+7. 在 `sqbair` 通过 `herdr plugin install gxbsst/herdr-mission --yes` 安装预编译 release，并恢复现有 `rust-version` Mission。
 
 回滚时重新安装 `v0.1.1` 可以恢复旧 runtime；数据库 schema 未变化，无需数据回滚。已由 `v0.1.2` 接管并持久化的 pane 仍是合法的旧版本运行状态。
 

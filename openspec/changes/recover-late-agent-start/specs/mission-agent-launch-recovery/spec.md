@@ -59,3 +59,10 @@
 #### Scenario: 恢复已分配但未完成的角色 pane
 - **WHEN** 角色已有持久化 `pane_id` 但稳定 Agent 名称仍为空
 - **THEN** 系统先验证并尝试接管该 pane 中的 Agent；只有尚无 Agent 时才启动，不再次 split，也不因 `agent_name_taken` 永久 blocked
+
+### Requirement: dashboard 保留恢复错误上下文
+dashboard MUST 在恢复失败状态中显示错误 code、失败 operation 和可读的底层原因；完整结构化错误 MUST 继续写入日志。
+
+#### Scenario: Herdr 拒绝区域查询
+- **WHEN** 恢复调用的 `tab get` 返回包含错误 message 的结构化 stderr
+- **THEN** dashboard 状态行显示 `tab get` 与该 message，不只显示 `launch_effect_failed`

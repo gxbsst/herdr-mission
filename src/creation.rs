@@ -9,12 +9,13 @@ use std::{
     collections::BTreeMap,
     fs,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
+use crate::herdr::AgentSnapshot;
 use crate::{
     bootstrap_database, open_writable, read_generation, ErrorCategory, KernelError, LaunchMode,
     OWNER_IDENTITY,
@@ -326,6 +327,14 @@ pub struct RoleRuntimeRow {
     pub thinking: String,
     pub pane_id: String,
     pub agent_name: String,
+}
+
+/// Summary of one complete Agent snapshot applied to persisted role bindings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleHealthReconciliation {
+    pub matched: u32,
+    pub missing: u32,
+    pub updated: u32,
 }
 
 /// Derive a short, deterministic `[a-z0-9]`-only token from a mission id.
@@ -681,7 +690,8 @@ pub fn read_mission_status(
 
     let pending_assignments: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM assignments WHERE mission_id = ?1 AND state = 'queued'",
+            "SELECT COUNT(*) FROM assignments
+             WHERE mission_id = ?1 AND state IN ('queued', 'active')",
             [mission_id],
             |row| row.get(0),
         )
@@ -891,7 +901,7 @@ pub fn read_mission_overviews(database: &Path) -> Result<Vec<MissionOverview>, K
     let mut pending_statement = connection
         .prepare(
             "SELECT mission_id, COUNT(*) FROM assignments
-             WHERE state = 'queued' GROUP BY mission_id",
+             WHERE state IN ('queued', 'active') GROUP BY mission_id",
         )
         .map_err(|error| sqlite_error("sqlite_status_read_failed", "overviews", error))?;
     let pending_rows = pending_statement
@@ -1031,6 +1041,134 @@ pub fn record_role_runtime(
         )
         .map_err(|error| sqlite_error("sqlite_role_update_failed", "record_role_runtime", error))?;
     Ok(())
+}
+
+/// Apply one complete Herdr Agent snapshot to every fully bound Mission role.
+///
+/// The persisted pane and Agent name are both part of the identity. Updates
+/// repeat that identity in the `WHERE` clause so a snapshot cannot overwrite a
+/// role that was rebound after the snapshot was captured.
+pub fn reconcile_role_healths(
+    database: &Path,
+    agents: &[AgentSnapshot],
+) -> Result<RoleHealthReconciliation, KernelError> {
+    reconcile_role_healths_with(database, || Ok(agents.to_vec()))
+}
+
+pub(crate) fn reconcile_role_healths_with(
+    database: &Path,
+    read_agents: impl FnOnce() -> Result<Vec<AgentSnapshot>, KernelError>,
+) -> Result<RoleHealthReconciliation, KernelError> {
+    if !database.exists() {
+        bootstrap_database(database)?;
+    }
+    let mut connection = open_writable(database, OWNER_IDENTITY)?;
+    connection
+        .busy_timeout(Duration::from_secs(10))
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_config_failed",
+                "reconcile_role_healths_busy_timeout",
+                error,
+            )
+        })?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| sqlite_error("sqlite_begin_failed", "reconcile_role_healths", error))?;
+
+    // Fetch while holding the write reservation so concurrent lifecycle events
+    // and role rebinds cannot reorder snapshot application.
+    let agents = read_agents()?;
+
+    let mut live_by_binding = BTreeMap::new();
+    for agent in &agents {
+        let Some(name) = agent.name.as_ref() else {
+            continue;
+        };
+        let key = (name.clone(), agent.pane_id.clone());
+        if let Some(previous) = live_by_binding.insert(key.clone(), agent.status) {
+            if previous != agent.status {
+                return Err(KernelError {
+                    category: ErrorCategory::Contract,
+                    code: "herdr_agent_snapshot_conflict".into(),
+                    message: "herdr returned conflicting states for one Agent binding".into(),
+                    retryable: false,
+                    details: BTreeMap::from([
+                        ("agent_name".into(), json!(key.0)),
+                        ("pane_id".into(), json!(key.1)),
+                    ]),
+                });
+            }
+        }
+    }
+
+    let bindings = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT mission_id, role, pane_id, terminal_id, health
+                 FROM team_roles
+                 WHERE pane_id <> '' AND terminal_id <> ''
+                 ORDER BY mission_id, role",
+            )
+            .map_err(|error| {
+                sqlite_error("sqlite_roles_read_failed", "reconcile_role_healths", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| {
+                sqlite_error("sqlite_roles_read_failed", "reconcile_role_healths", error)
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            sqlite_error("sqlite_roles_read_failed", "reconcile_role_healths", error)
+        })?
+    };
+
+    let now = utc_timestamp();
+    let mut report = RoleHealthReconciliation {
+        matched: 0,
+        missing: 0,
+        updated: 0,
+    };
+    for (mission_id, role, pane_id, agent_name, current_health) in bindings {
+        let health = match live_by_binding.get(&(agent_name.clone(), pane_id.clone())) {
+            Some(status) => {
+                report.matched += 1;
+                status.as_str()
+            }
+            None => {
+                report.missing += 1;
+                "missing"
+            }
+        };
+        if current_health == health {
+            continue;
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE team_roles
+                 SET health = ?1, updated_at = ?2
+                 WHERE mission_id = ?3 AND role = ?4
+                   AND pane_id = ?5 AND terminal_id = ?6",
+                params![health, now, mission_id, role, pane_id, agent_name],
+            )
+            .map_err(|error| {
+                sqlite_error("sqlite_role_update_failed", "reconcile_role_healths", error)
+            })?;
+        report.updated += u32::try_from(changed).unwrap_or(u32::MAX);
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| sqlite_error("sqlite_commit_failed", "reconcile_role_healths", error))?;
+    Ok(report)
 }
 
 /// Set the Mission lifecycle stage.

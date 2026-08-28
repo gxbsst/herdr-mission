@@ -81,6 +81,13 @@ fn bootstrap_migrates_legacy_mission_state_with_manual_launch_mode() {
 
     let connection = Connection::open(&path).unwrap();
     connection
+        .execute(
+            "INSERT INTO team_missions(mission_id, brief, created_at, updated_at)
+             VALUES(?1, '', '2026-08-28T00:00:00Z', '2026-08-28T00:00:00Z')",
+            ["msn-workspace-field-shift"],
+        )
+        .unwrap();
+    connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
              ALTER TABLE mission_state RENAME TO mission_state_current;
@@ -117,6 +124,114 @@ fn bootstrap_migrates_legacy_mission_state_with_manual_launch_mode() {
         )
         .unwrap();
     assert_eq!(column_count, 1);
+
+    cleanup(&path);
+}
+
+#[test]
+fn bootstrap_repairs_known_workspace_field_shift_idempotently() {
+    let path = temp_db_path("workspace-field-shift");
+    bootstrap_database(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO team_missions(mission_id, brief, created_at, updated_at)
+             VALUES(?1, '', '2026-08-28T00:00:00Z', '2026-08-28T00:00:00Z')",
+            ["msn-workspace-field-shift"],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO mission_workspace(
+                mission_id, source, workspace_id, tab_id, root_pane_id,
+                execution_tab_id, review_tab_id, verification_tab_id,
+                worktree_path, branch
+             ) VALUES(?1, 'worktree', 'w78', 'w78:t1', 'w78:p1', 'w78:t1', ?2, ?3, '', '')",
+            rusqlite::params![
+                "msn-workspace-field-shift",
+                "/repo/.worktree/x",
+                "feature/x-220507ac85f8"
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    bootstrap_database(&path).unwrap();
+    bootstrap_database(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let repaired: (String, String, String, String, String) = connection
+        .query_row(
+            "SELECT execution_tab_id, review_tab_id, verification_tab_id,
+                    worktree_path, branch
+             FROM mission_workspace WHERE mission_id = 'msn-workspace-field-shift'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(repaired.0, "w78:t1");
+    assert_eq!(repaired.1, "");
+    assert_eq!(repaired.2, "");
+    assert_eq!(repaired.3, "/repo/.worktree/x");
+    assert_eq!(repaired.4, "feature/x-220507ac85f8");
+
+    cleanup(&path);
+}
+
+#[test]
+fn bootstrap_does_not_guess_at_unknown_workspace_corruption() {
+    let path = temp_db_path("workspace-unknown-shape");
+    bootstrap_database(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO team_missions(mission_id, brief, created_at, updated_at)
+             VALUES(?1, '', '2026-08-28T00:00:00Z', '2026-08-28T00:00:00Z')",
+            ["msn-workspace-unknown-shape"],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO mission_workspace(
+                mission_id, source, workspace_id, tab_id, root_pane_id,
+                execution_tab_id, review_tab_id, verification_tab_id,
+                worktree_path, branch
+             ) VALUES(?1, 'worktree', 'w78', 'w78:t1', 'w78:p1', 'w78:t1', ?2, 'w78:t3', '', '')",
+            rusqlite::params!["msn-workspace-unknown-shape", "/repo/.worktree/x"],
+        )
+        .unwrap();
+    drop(connection);
+
+    bootstrap_database(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let persisted: (String, String, String, String) = connection
+        .query_row(
+            "SELECT review_tab_id, verification_tab_id, worktree_path, branch
+             FROM mission_workspace WHERE mission_id = 'msn-workspace-unknown-shape'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted,
+        (
+            "/repo/.worktree/x".into(),
+            "w78:t3".into(),
+            String::new(),
+            String::new()
+        )
+    );
 
     cleanup(&path);
 }

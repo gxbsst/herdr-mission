@@ -161,7 +161,65 @@ fn migrate_mission_workspace(connection: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
+    repair_shifted_mission_workspaces(connection)?;
     Ok(())
+}
+
+fn repair_shifted_mission_workspaces(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT mission_id, source, tab_id, execution_tab_id, review_tab_id,
+                verification_tab_id, worktree_path, branch
+         FROM mission_workspace",
+    )?;
+    let candidates = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    for (mission_id, source, tab_id, execution, review, verification, worktree, branch) in
+        candidates
+    {
+        let known_shift = matches!(source.as_str(), "worktree" | "import")
+            && worktree.is_empty()
+            && branch.is_empty()
+            && execution == tab_id
+            && looks_like_tab_id(&execution)
+            && Path::new(&review).is_absolute()
+            && !verification.is_empty()
+            && !looks_like_tab_id(&verification);
+        if known_shift {
+            connection.execute(
+                "UPDATE mission_workspace
+                 SET review_tab_id = '', verification_tab_id = '',
+                     worktree_path = ?1, branch = ?2
+                 WHERE mission_id = ?3",
+                rusqlite::params![review, verification, mission_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_tab_id(value: &str) -> bool {
+    let Some((workspace, tab)) = value.rsplit_once(":t") else {
+        return false;
+    };
+    !workspace.is_empty()
+        && !tab.is_empty()
+        && tab
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
 }
 
 fn migrate_mission_state(connection: &Connection) -> rusqlite::Result<()> {

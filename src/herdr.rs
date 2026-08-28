@@ -59,6 +59,47 @@ pub struct TabInfo {
     pub label: String,
 }
 
+/// Herdr's canonical live Agent states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Unknown,
+}
+
+impl AgentStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "idle" => Some(Self::Idle),
+            "working" => Some(Self::Working),
+            "blocked" => Some(Self::Blocked),
+            "done" => Some(Self::Done),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// Live identity and status from one `herdr agent list` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSnapshot {
+    pub name: Option<String>,
+    pub pane_id: String,
+    pub status: AgentStatus,
+}
+
 /// Identifiers returned by `herdr worktree create` / `worktree open`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreated {
@@ -260,6 +301,11 @@ pub fn agent_rename_argv(pane_id: &str, name: &str) -> Vec<String> {
     ]
 }
 
+/// Build argv for the structured Agent snapshot used by Mission reconciliation.
+pub fn agent_list_argv() -> Vec<String> {
+    vec!["agent".to_string(), "list".to_string()]
+}
+
 /// Build argv for `herdr pane run` to inject a command into a shell pane.
 pub fn pane_run_argv(pane_id: &str, command: &str) -> Vec<String> {
     vec![
@@ -411,6 +457,35 @@ pub fn parse_worktree_create(response: &str) -> Result<WorktreeCreated, KernelEr
     })
 }
 
+/// Parse the complete `herdr agent list` response.
+pub fn parse_agent_list(response: &str) -> Result<Vec<AgentSnapshot>, KernelError> {
+    let value = parse_json(response, "agent list")?;
+    let result = field(&value, "result", "agent list")?;
+    let agents = result
+        .get("agents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| missing_field("agent list", "agents"))?;
+
+    agents
+        .iter()
+        .map(|agent| {
+            let status_value = string_field(agent, "agent_status", "agent list")?;
+            let status = AgentStatus::parse(&status_value).ok_or_else(|| KernelError {
+                category: ErrorCategory::Contract,
+                code: "herdr_agent_status_unrecognized".into(),
+                message: "herdr returned an unrecognized Agent status".into(),
+                retryable: false,
+                details: BTreeMap::from([("agent_status".into(), json!(status_value))]),
+            })?;
+            Ok(AgentSnapshot {
+                name: optional_nullable_string_field(agent, "name", "agent list")?,
+                pane_id: string_field(agent, "pane_id", "agent list")?,
+                status,
+            })
+        })
+        .collect()
+}
+
 fn parse_json(response: &str, operation: &str) -> Result<Value, KernelError> {
     serde_json::from_str::<Value>(response).map_err(|error| KernelError {
         category: ErrorCategory::Transport,
@@ -443,6 +518,28 @@ fn optional_string_field(value: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_string)
+}
+
+fn optional_nullable_string_field(
+    value: &Value,
+    key: &str,
+    operation: &str,
+) -> Result<Option<String>, KernelError> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.is_empty() => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(KernelError {
+            category: ErrorCategory::Transport,
+            code: "herdr_response_invalid_field".into(),
+            message: "herdr response field has an invalid type".into(),
+            retryable: false,
+            details: BTreeMap::from([
+                ("operation".into(), json!(operation)),
+                ("field".into(), json!(key)),
+            ]),
+        }),
+    }
 }
 
 /// Read `value[object][key]` as a non-empty string. Herdr's `WorkspaceCreated`
@@ -633,6 +730,52 @@ mod tests {
                 branch: "feature/x-abc".into(),
             }
         );
+    }
+
+    #[test]
+    fn parses_agent_list_with_optional_names_and_all_supported_statuses() {
+        let agents = parse_agent_list(
+            r#"{"result":{"agents":[
+                {"name":"mission-pm","pane_id":"w16:p1","agent_status":"idle"},
+                {"name":"mission-worker","pane_id":"w16:p2","agent_status":"working"},
+                {"name":"mission-scout","pane_id":"w16:p3","agent_status":"blocked"},
+                {"name":"mission-reviewer","pane_id":"w16:p4","agent_status":"done"},
+                {"pane_id":"w16:p5","agent_status":"unknown"}
+            ]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(agents.len(), 5);
+        assert_eq!(agents[0].name.as_deref(), Some("mission-pm"));
+        assert_eq!(agents[0].status, AgentStatus::Idle);
+        assert_eq!(agents[1].status, AgentStatus::Working);
+        assert_eq!(agents[2].status, AgentStatus::Blocked);
+        assert_eq!(agents[3].status, AgentStatus::Done);
+        assert_eq!(agents[4].name, None);
+        assert_eq!(agents[4].status, AgentStatus::Unknown);
+    }
+
+    #[test]
+    fn rejects_unrecognized_agent_status_and_malformed_agent_list_json() {
+        let status_error = parse_agent_list(
+            r#"{"result":{"agents":[{"name":"mission-pm","pane_id":"w16:p1","agent_status":"paused"}]}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(status_error.code, "herdr_agent_status_unrecognized");
+
+        let json_error = parse_agent_list("not json").unwrap_err();
+        assert_eq!(json_error.code, "herdr_response_malformed");
+
+        let name_error = parse_agent_list(
+            r#"{"result":{"agents":[{"name":123,"pane_id":"w16:p1","agent_status":"working"}]}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(name_error.code, "herdr_response_invalid_field");
+    }
+
+    #[test]
+    fn builds_agent_list_argv() {
+        assert_eq!(agent_list_argv(), vec!["agent", "list"]);
     }
 
     #[test]

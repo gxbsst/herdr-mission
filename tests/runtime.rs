@@ -41,6 +41,8 @@ struct FakeRunner {
     agent_start_failure_pane: Option<&'static str>,
     pane_not_found_pane: Option<&'static str>,
     remaining_pane_not_found: Cell<u32>,
+    missing_tab: Option<&'static str>,
+    missing_workspace: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +77,8 @@ impl FakeRunner {
             agent_start_failure_pane: None,
             pane_not_found_pane: None,
             remaining_pane_not_found: Cell::new(0),
+            missing_tab: None,
+            missing_workspace: None,
         }
     }
 
@@ -113,6 +117,16 @@ impl FakeRunner {
     fn with_transient_pane_not_found(mut self, pane_id: &'static str, polls: u32) -> Self {
         self.pane_not_found_pane = Some(pane_id);
         self.remaining_pane_not_found.set(polls);
+        self
+    }
+
+    fn with_missing_tab(mut self, tab_id: &'static str) -> Self {
+        self.missing_tab = Some(tab_id);
+        self
+    }
+
+    fn with_missing_workspace(mut self, workspace_id: &'static str) -> Self {
+        self.missing_workspace = Some(workspace_id);
         self
     }
 
@@ -188,13 +202,27 @@ impl ProcessRunner for FakeRunner {
                 stderr: String::new(),
             }),
             Some("tab") if args.get(1).map(String::as_str) == Some("list") => {
+                let workspace_id = args
+                    .windows(2)
+                    .find(|pair| pair[0] == "--workspace")
+                    .map(|pair| pair[1].as_str())
+                    .unwrap_or("w6J:ws1");
+                if self.missing_workspace == Some(workspace_id) {
+                    return Ok(ProcessOutput {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: format!(
+                            r#"{{"error":{{"code":"workspace_not_found","message":"workspace {workspace_id} not found"}},"id":"cli:tab:list"}}"#
+                        ),
+                    });
+                }
                 let tabs = self
                     .tab_labels
                     .borrow()
                     .iter()
                     .map(|(tab_id, label)| {
                         serde_json::json!({
-                            "workspace_id": "w6J:ws1",
+                            "workspace_id": workspace_id,
                             "tab_id": tab_id,
                             "label": label,
                         })
@@ -226,6 +254,15 @@ impl ProcessRunner for FakeRunner {
             }
             Some("tab") if args.get(1).map(String::as_str) == Some("get") => {
                 let tab_id = args.get(2).map(String::as_str).unwrap_or("w6J:t1");
+                if self.missing_tab == Some(tab_id) {
+                    return Ok(ProcessOutput {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: format!(
+                            r#"{{"error":{{"code":"tab_not_found","message":"tab {tab_id} not found"}},"id":"cli:tab:get"}}"#
+                        ),
+                    });
+                }
                 let label = self
                     .tab_labels
                     .borrow()
@@ -1297,6 +1334,114 @@ fn persisted_region_tabs_converge_back_to_the_three_fixed_names() {
             .get(&workspace.verification_tab_id)
             .map(String::as_str),
         Some("验证")
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn persisted_workspace_missing_from_current_session_fails_before_launch_effects() {
+    let path = temp_db("workspace-current-session-missing");
+    let mission_id = "msn-20260828-093000-session-missing-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    upsert_workspace(
+        &path,
+        mission_id,
+        &MissionWorkspace {
+            source: WorkspaceSource::Worktree,
+            workspace_id: "w78".into(),
+            tab_id: "w78:t1".into(),
+            root_pane_id: "w78:p1".into(),
+            execution_tab_id: "w78:t1".into(),
+            review_tab_id: "w78:t2".into(),
+            verification_tab_id: "w78:t3".into(),
+            worktree_path: "/repo/.worktree/x".into(),
+            branch: "feature/x".into(),
+        },
+    )
+    .unwrap();
+    let runner = FakeRunner::success().with_missing_workspace("w78");
+
+    let error = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, "mission_workspace_unavailable");
+    assert!(!error.retryable);
+    assert_eq!(
+        error.details.get("operation"),
+        Some(&serde_json::json!("tab list"))
+    );
+    assert_eq!(
+        error.details.get("workspace_id"),
+        Some(&serde_json::json!("w78"))
+    );
+    assert_eq!(runner.count_calls("tab", "get"), 0);
+    assert_eq!(runner.count_calls("tab", "create"), 0);
+    assert_eq!(runner.count_calls("pane", "split"), 0);
+    assert_eq!(runner.count_calls("agent", "start"), 0);
+    assert_eq!(
+        read_mission_status(&path, mission_id).unwrap().stage,
+        "blocked"
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn persisted_region_missing_from_existing_workspace_has_a_specific_error() {
+    let path = temp_db("region-current-session-missing");
+    let mission_id = "msn-20260828-093100-region-missing-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    upsert_workspace(
+        &path,
+        mission_id,
+        &MissionWorkspace {
+            source: WorkspaceSource::Worktree,
+            workspace_id: "w78".into(),
+            tab_id: "w78:t1".into(),
+            root_pane_id: "w78:p1".into(),
+            execution_tab_id: "w78:t1".into(),
+            review_tab_id: "w78:t2".into(),
+            verification_tab_id: "w78:t3".into(),
+            worktree_path: "/repo/.worktree/x".into(),
+            branch: "feature/x".into(),
+        },
+    )
+    .unwrap();
+    let runner = FakeRunner::success().with_missing_tab("w78:t1");
+
+    let error = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, "mission_region_unavailable");
+    assert!(!error.retryable);
+    assert_eq!(
+        error.details.get("operation"),
+        Some(&serde_json::json!("tab get"))
+    );
+    assert_eq!(
+        error.details.get("workspace_id"),
+        Some(&serde_json::json!("w78"))
+    );
+    assert_eq!(
+        error.details.get("tab_id"),
+        Some(&serde_json::json!("w78:t1"))
+    );
+    assert_eq!(
+        error.details.get("region"),
+        Some(&serde_json::json!("工作区"))
     );
     cleanup(&path);
 }

@@ -298,6 +298,8 @@ pub fn start_role(
             },
         )
     })?;
+    validate_workspace_available(runner, herdr, &workspace.workspace_id)
+        .map_err(|error| blocked(database, mission_id, error))?;
     let role_cwd = mission_worktree(&workspace, cwd).to_string();
     validate_work_region_pane(runner, herdr, anchor_pane_id, &workspace, &role_cwd)
         .map_err(|error| blocked(database, mission_id, error))?;
@@ -423,6 +425,8 @@ fn ensure_mission_workspace(
 ) -> Result<MissionWorkspace, KernelError> {
     if let Some(existing) = read_workspace(database, mission_id)? {
         if !existing.workspace_id.is_empty() {
+            validate_workspace_available(runner, herdr, &existing.workspace_id)
+                .map_err(|error| blocked(database, mission_id, error))?;
             return Ok(existing);
         }
     }
@@ -557,6 +561,37 @@ fn ensure_mission_workspace(
     upsert_workspace(database, mission_id, &workspace)
         .map_err(|error| blocked(database, mission_id, error))?;
     Ok(workspace)
+}
+
+fn validate_workspace_available(
+    runner: &dyn ProcessRunner,
+    herdr: &str,
+    workspace_id: &str,
+) -> Result<(), KernelError> {
+    let output = run(runner, herdr, &tab_list_argv(workspace_id))?;
+    if output.exit_code != 0 {
+        if output_has_error_code(&output, "workspace_not_found") {
+            return Err(workspace_unavailable(workspace_id, &output));
+        }
+        return Err(launch_failed("tab list", &output));
+    }
+    parse_tab_list(&output.stdout)?;
+    Ok(())
+}
+
+fn workspace_unavailable(workspace_id: &str, output: &ProcessOutput) -> KernelError {
+    KernelError {
+        category: ErrorCategory::Infrastructure,
+        code: "mission_workspace_unavailable".into(),
+        message: "Persisted Mission workspace is unavailable in the current Herdr session".into(),
+        retryable: false,
+        details: BTreeMap::from([
+            ("operation".into(), json!("tab list")),
+            ("workspace_id".into(), json!(workspace_id)),
+            ("exit_code".into(), json!(output.exit_code)),
+            ("stderr".into(), json!(output.stderr)),
+        ]),
+    }
 }
 
 /// Build the 工作区/审查/验证 region tabs inside the workspace.
@@ -856,6 +891,9 @@ fn ensure_named_tab(
 ) -> Result<(), KernelError> {
     let output = run(runner, herdr, &tab_get_argv(tab_id))?;
     if output.exit_code != 0 {
+        if output_has_error_code(&output, "tab_not_found") {
+            return Err(region_unavailable(workspace_id, tab_id, label, &output));
+        }
         return Err(launch_failed("tab get", &output));
     }
     let current = parse_tab_get(&output.stdout)?;
@@ -881,6 +919,44 @@ fn ensure_named_tab(
         return Err(launch_failed("tab rename", &renamed));
     }
     Ok(())
+}
+
+fn output_has_error_code(output: &ProcessOutput, expected: &str) -> bool {
+    [&output.stderr, &output.stdout].into_iter().any(|raw| {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some(expected)
+    })
+}
+
+fn region_unavailable(
+    workspace_id: &str,
+    tab_id: &str,
+    label: &str,
+    output: &ProcessOutput,
+) -> KernelError {
+    KernelError {
+        category: ErrorCategory::Infrastructure,
+        code: "mission_region_unavailable".into(),
+        message: "Mission region is unavailable in the current Herdr session".into(),
+        retryable: false,
+        details: BTreeMap::from([
+            ("operation".into(), json!("tab get")),
+            ("workspace_id".into(), json!(workspace_id)),
+            ("tab_id".into(), json!(tab_id)),
+            ("region".into(), json!(label)),
+            ("exit_code".into(), json!(output.exit_code)),
+            ("stderr".into(), json!(output.stderr)),
+        ]),
+    }
 }
 
 fn create_stage_tab(

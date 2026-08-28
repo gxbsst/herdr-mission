@@ -15,14 +15,15 @@ use serde_json::json;
 use crate::{
     agent_name_token, agent_rename_argv, bootstrap_database, compute_manifest, create_mission,
     delete_mission, herdr_bin, is_valid_role_identity, kernel_deliver, kernel_dispatch_command,
-    kernel_read_context, kernel_reply_command, launch_mission, list_missions, make_mission_id,
-    manifest_path_for, open_writable, pane_rename_argv, read_generation, read_manifest,
-    read_mission_launch_mode, read_mission_status, read_role_runtime, record_role_runtime,
-    request_stop, resolve_mission_id, resolve_roles, run_daemon, run_tui, set_mission_launch_mode,
-    source_cwd, start_role, utc_timestamp, verify_binary, workspace_close_argv, write_manifest,
-    CreateMissionRequest, ErrorCategory, KernelError, LaunchConfig, LaunchMode, LaunchOptions,
-    LaunchedRole, MissionLayout, ProcessRunner, Provider, RoleOverride, SystemProcessRunner,
-    WorkspaceSource, OWNER_IDENTITY, PROTOCOL_VERSION, SCHEMA_VERSION,
+    kernel_read_context, kernel_reconcile, kernel_reply_command, launch_mission, list_missions,
+    make_mission_id, manifest_path_for, open_writable, pane_rename_argv, read_generation,
+    read_manifest, read_mission_launch_mode, read_mission_status, read_role_runtime,
+    record_role_runtime, request_stop, resolve_mission_id, resolve_roles, run_daemon, run_tui,
+    set_mission_launch_mode, source_cwd, start_role, utc_timestamp, verify_binary,
+    workspace_close_argv, write_manifest, CreateMissionRequest, ErrorCategory, KernelError,
+    LaunchConfig, LaunchMode, LaunchOptions, LaunchedRole, MissionLayout, ProcessRunner, Provider,
+    RoleOverride, SystemProcessRunner, WorkspaceSource, OWNER_IDENTITY, PROTOCOL_VERSION,
+    SCHEMA_VERSION,
 };
 
 /// Exit code for an unknown subcommand (distinct from malformed input).
@@ -46,6 +47,7 @@ pub fn run(args: &[String]) -> i32 {
         Some("send") => run_send(iter),
         Some("reply") => run_reply(iter),
         Some("deliver") => run_deliver(iter),
+        Some("reconcile") => run_reconcile(iter),
         Some("daemon") => run_daemon_cmd(iter),
         Some("stop") => run_stop(iter),
         Some("resume") => run_resume(iter),
@@ -77,6 +79,7 @@ fn print_usage() -> i32 {
            send        派发 Assignment 给目标角色\n\
            reply       回执 Assignment\n\
            deliver     投递 outbox\n\
+           reconcile   协调 Agent 实时状态并投递 outbox\n\
            start-role  按需启动一个角色\n\
            join        手动把当前 agent 加入为某角色\n\
            resume      恢复未启动的角色\n\
@@ -1080,6 +1083,94 @@ fn run_deliver<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
     }
 }
 
+fn run_reconcile<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
+    let mut database: Option<PathBuf> = None;
+    let mut json_mode = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json_mode = true,
+            "--help" | "-h" => {
+                return command_help("reconcile", "[--database <path>] [--json]");
+            }
+            "--database" => {
+                return cli_fail(
+                    json_mode,
+                    malformed("--database requires a value"),
+                    EXIT_MALFORMED_ARGS,
+                );
+            }
+            value if value.starts_with("--database=") => {
+                database = Some(PathBuf::from(&value["--database=".len()..]));
+            }
+            other => {
+                return cli_fail(
+                    json_mode,
+                    malformed(format!("unexpected argument: {other}")),
+                    EXIT_MALFORMED_ARGS,
+                );
+            }
+        }
+    }
+
+    let database = match database.or_else(default_database) {
+        Some(path) => path,
+        None => {
+            return cli_fail(
+                json_mode,
+                malformed("cannot resolve a state directory or HOME for default database path"),
+                EXIT_MALFORMED_ARGS,
+            );
+        }
+    };
+
+    let runner = SystemProcessRunner;
+    let report = kernel_reconcile(&database, &runner, &herdr_bin());
+    let health_ok = report.health.is_ok();
+    let delivery_ok = report.delivery.is_ok();
+    let status = match (health_ok, delivery_ok) {
+        (true, true) => "ok",
+        (false, false) => "error",
+        _ => "partial",
+    };
+    let health = match report.health {
+        Ok(health) => json!({
+            "status": "ok",
+            "matched": health.matched,
+            "missing": health.missing,
+            "updated": health.updated,
+        }),
+        Err(error) => json!({"status": "error", "error": error}),
+    };
+    let delivery = match report.delivery {
+        Ok(delivery) => json!({
+            "status": "ok",
+            "delivered": delivery.delivered,
+            "failed": delivery.failed,
+        }),
+        Err(error) => json!({"status": "error", "error": error}),
+    };
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "status": status,
+                "health": health,
+                "delivery": delivery,
+            }))
+            .expect("reconcile outcome must serialize")
+        );
+    } else {
+        println!("status={status} health={health} delivery={delivery}");
+    }
+
+    if health_ok && delivery_ok {
+        0
+    } else {
+        1
+    }
+}
+
 fn run_daemon_cmd<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
     let mut database: Option<PathBuf> = None;
     let mut interval_ms: u64 = 2_000;
@@ -1241,6 +1332,10 @@ fn run_resume<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
         }
     };
 
+    if let Err(error) = bootstrap_database(&database) {
+        return cli_fail(json_mode, error, 1);
+    }
+
     let cwd = source_cwd();
     let options = LaunchOptions {
         direction: "right".into(),
@@ -1343,6 +1438,10 @@ fn run_start_role<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
             );
         }
     };
+
+    if let Err(error) = bootstrap_database(&database) {
+        return cli_fail(json_mode, error, 1);
+    }
 
     let pm_pane_id = match read_role_runtime(&database, &mission_id)
         .ok()

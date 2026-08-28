@@ -5,10 +5,10 @@ use std::{
 
 use herdr_mission::{
     bootstrap_database, create_mission, default_codex_team, delete_mission, make_mission_id,
-    parse_role_ref, read_mission_launch_mode, read_mission_status, read_workspace,
-    resolve_mission_id, resolve_roles, role_kind, set_mission_launch_mode, upsert_workspace,
-    utc_timestamp, CreateMissionRequest, LaunchMode, MissionLayout, MissionWorkspace, Provider,
-    RoleKind, RoleOverride, WorkspaceSource, TEAM_ROLES,
+    parse_role_ref, read_mission_launch_mode, read_mission_overviews, read_mission_status,
+    read_workspace, resolve_mission_id, resolve_roles, role_kind, set_mission_launch_mode,
+    upsert_workspace, utc_timestamp, CreateMissionRequest, LaunchMode, MissionLayout,
+    MissionWorkspace, Provider, RoleKind, RoleOverride, WorkspaceSource, TEAM_ROLES,
 };
 use rusqlite::Connection;
 
@@ -195,7 +195,7 @@ fn read_mission_status_rejects_missing_mission() {
 }
 
 #[test]
-fn read_mission_status_counts_only_queued_assignments_as_pending() {
+fn mission_status_and_overview_count_queued_and_active_assignments_as_pending() {
     let path = temp_db_path("status-pending-scope");
     create_mission(&path, &request("msn-test-pending-scope")).unwrap();
 
@@ -218,9 +218,14 @@ fn read_mission_status_counts_only_queued_assignments_as_pending() {
     insert("asg-queued", "queued");
 
     let status = read_mission_status(&path, "msn-test-pending-scope").unwrap();
-    // An in-progress (active) assignment is not pending; only not-yet-delivered
-    // (queued) assignments count, so this reads 1, not 2.
-    assert_eq!(status.pending_assignments, 1);
+    assert_eq!(status.pending_assignments, 2);
+
+    let overview = read_mission_overviews(&path)
+        .unwrap()
+        .into_iter()
+        .find(|mission| mission.mission_id == "msn-test-pending-scope")
+        .unwrap();
+    assert_eq!(overview.pending_assignments, 2);
 
     cleanup(&path);
 }

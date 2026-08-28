@@ -1,13 +1,18 @@
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
     time::Duration,
 };
 
 use herdr_mission::{
     create_mission, default_codex_team, kernel_deliver, kernel_dispatch_command,
-    kernel_read_context, kernel_reply_command, read_role_context, CreateMissionRequest,
+    kernel_read_context, kernel_reconcile, kernel_reply_command, read_role_context,
+    reconcile_role_healths, record_role_runtime, AgentSnapshot, AgentStatus, CreateMissionRequest,
     InspectQuery, LaunchMode, MissionKernel, ProcessOutput, ProcessRunner,
 };
 use rusqlite::Connection;
@@ -296,6 +301,319 @@ impl ProcessRunner for AgentNotFoundRunner {
             stderr: String::new(),
         })
     }
+}
+
+#[test]
+fn role_health_reconciliation_uses_exact_bindings_and_marks_missing_roles() {
+    let path = temp_db("role-health-reconcile");
+    create_mission(&path, &request("msn-role-health-reconcile")).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for (role, pane, name, health) in [
+        ("pm", "w16:p1", "mission-pm", "idle"),
+        ("scout", "w16:p3", "mission-scout", "working"),
+        ("reviewer", "w16:p6", "mission-reviewer", "idle"),
+    ] {
+        connection
+            .execute(
+                "UPDATE team_roles SET pane_id = ?1, terminal_id = ?2, health = ?3
+                 WHERE mission_id = 'msn-role-health-reconcile' AND role = ?4",
+                rusqlite::params![pane, name, health, role],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let report = reconcile_role_healths(
+        &path,
+        &[
+            AgentSnapshot {
+                name: Some("mission-pm".into()),
+                pane_id: "w16:p1".into(),
+                status: AgentStatus::Working,
+            },
+            AgentSnapshot {
+                name: Some("mission-scout".into()),
+                pane_id: "w16:p3".into(),
+                status: AgentStatus::Done,
+            },
+            // Same name but a different pane must not be adopted.
+            AgentSnapshot {
+                name: Some("mission-reviewer".into()),
+                pane_id: "w16:p9".into(),
+                status: AgentStatus::Working,
+            },
+            // An unnamed Core agent cannot match a persisted role binding.
+            AgentSnapshot {
+                name: None,
+                pane_id: "w16:p7".into(),
+                status: AgentStatus::Idle,
+            },
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(report.matched, 2);
+    assert_eq!(report.missing, 1);
+    assert_eq!(report.updated, 3);
+    let connection = Connection::open(&path).unwrap();
+    let health = |role: &str| -> String {
+        connection
+            .query_row(
+                "SELECT health FROM team_roles
+                 WHERE mission_id = 'msn-role-health-reconcile' AND role = ?1",
+                [role],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(health("pm"), "working");
+    assert_eq!(health("scout"), "done");
+    assert_eq!(health("reviewer"), "missing");
+    assert_eq!(health("worker"), "unknown");
+
+    cleanup(&path);
+}
+
+struct MalformedListRunner {
+    calls: RefCell<Vec<Vec<String>>>,
+}
+
+struct BlockingSnapshotRunner {
+    started: mpsc::Sender<()>,
+    release: Option<mpsc::Receiver<()>>,
+    status: &'static str,
+}
+
+impl ProcessRunner for BlockingSnapshotRunner {
+    fn run(&self, _program: &str, args: &[String]) -> std::io::Result<ProcessOutput> {
+        if args == ["agent", "list"] {
+            self.started.send(()).unwrap();
+            if let Some(release) = &self.release {
+                release.recv().unwrap();
+            }
+            return Ok(ProcessOutput {
+                exit_code: 0,
+                stdout: format!(
+                    r#"{{"result":{{"agents":[{{"name":"mission-reviewer","pane_id":"w16:p6","agent_status":"{}"}}]}}}}"#,
+                    self.status
+                ),
+                stderr: String::new(),
+            });
+        }
+        Ok(ProcessOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[test]
+fn concurrent_reconciles_fetch_and_apply_snapshots_in_commit_order() {
+    let path = temp_db("reconcile-serialization");
+    create_mission(&path, &request("msn-reconcile-serialization")).unwrap();
+    record_role_runtime(
+        &path,
+        "msn-reconcile-serialization",
+        "reviewer",
+        "w16:p6",
+        "mission-reviewer",
+    )
+    .unwrap();
+
+    let (old_started_tx, old_started_rx) = mpsc::channel();
+    let (old_release_tx, old_release_rx) = mpsc::channel();
+    let old_path = path.clone();
+    let old = thread::spawn(move || {
+        let runner = BlockingSnapshotRunner {
+            started: old_started_tx,
+            release: Some(old_release_rx),
+            status: "working",
+        };
+        kernel_reconcile(&old_path, &runner, "herdr")
+    });
+    old_started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let (new_started_tx, new_started_rx) = mpsc::channel();
+    let new_path = path.clone();
+    let new = thread::spawn(move || {
+        let runner = BlockingSnapshotRunner {
+            started: new_started_tx,
+            release: None,
+            status: "idle",
+        };
+        kernel_reconcile(&new_path, &runner, "herdr")
+    });
+    assert!(matches!(
+        new_started_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    old_release_tx.send(()).unwrap();
+    old.join().unwrap().health.unwrap();
+    new_started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    new.join().unwrap().health.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let health: String = connection
+        .query_row(
+            "SELECT health FROM team_roles
+             WHERE mission_id = 'msn-reconcile-serialization' AND role = 'reviewer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(health, "idle");
+
+    cleanup(&path);
+}
+
+#[test]
+fn role_rebind_waits_for_snapshot_and_is_not_marked_missing() {
+    let path = temp_db("reconcile-rebind");
+    create_mission(&path, &request("msn-reconcile-rebind")).unwrap();
+    record_role_runtime(
+        &path,
+        "msn-reconcile-rebind",
+        "reviewer",
+        "w16:p6",
+        "mission-reviewer",
+    )
+    .unwrap();
+
+    let (snapshot_started_tx, snapshot_started_rx) = mpsc::channel();
+    let (snapshot_release_tx, snapshot_release_rx) = mpsc::channel();
+    let reconcile_path = path.clone();
+    let reconcile = thread::spawn(move || {
+        let runner = BlockingSnapshotRunner {
+            started: snapshot_started_tx,
+            release: Some(snapshot_release_rx),
+            status: "working",
+        };
+        kernel_reconcile(&reconcile_path, &runner, "herdr")
+    });
+    snapshot_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+
+    let (rebind_done_tx, rebind_done_rx) = mpsc::channel();
+    let rebind_path = path.clone();
+    let rebind = thread::spawn(move || {
+        let result = record_role_runtime(
+            &rebind_path,
+            "msn-reconcile-rebind",
+            "reviewer",
+            "w16:p9",
+            "mission-reviewer-new",
+        );
+        rebind_done_tx.send(result).unwrap();
+    });
+    assert!(matches!(
+        rebind_done_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    snapshot_release_tx.send(()).unwrap();
+    reconcile.join().unwrap().health.unwrap();
+    rebind_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    rebind.join().unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let (pane_id, agent_name, health): (String, String, String) = connection
+        .query_row(
+            "SELECT pane_id, terminal_id, health FROM team_roles
+             WHERE mission_id = 'msn-reconcile-rebind' AND role = 'reviewer'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(pane_id, "w16:p9");
+    assert_eq!(agent_name, "mission-reviewer-new");
+    assert_eq!(health, "idle");
+
+    cleanup(&path);
+}
+
+impl ProcessRunner for MalformedListRunner {
+    fn run(&self, _program: &str, args: &[String]) -> std::io::Result<ProcessOutput> {
+        self.calls.borrow_mut().push(args.to_vec());
+        if args == ["agent", "list"] {
+            return Ok(ProcessOutput {
+                exit_code: 0,
+                stdout: "not json".into(),
+                stderr: String::new(),
+            });
+        }
+        Ok(ProcessOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[test]
+fn reconciliation_failure_preserves_health_and_still_delivers_outbox() {
+    let path = temp_db("reconcile-failure-delivery");
+    create_mission(&path, &request("msn-reconcile-failure-delivery")).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles
+             SET pane_id = 'w16:p2', terminal_id = 'mission-worker', health = 'idle'
+             WHERE mission_id = 'msn-reconcile-failure-delivery' AND role = 'worker'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    kernel_dispatch_command(
+        &path,
+        "msn-reconcile-failure-delivery",
+        "pm",
+        "worker",
+        "task",
+        "deliver despite failed health sync",
+    )
+    .unwrap();
+
+    let runner = MalformedListRunner {
+        calls: RefCell::new(Vec::new()),
+    };
+    let report = kernel_reconcile(&path, &runner, "herdr");
+    assert_eq!(report.health.unwrap_err().code, "herdr_response_malformed");
+    assert_eq!(report.delivery.unwrap().delivered, 1);
+
+    let connection = Connection::open(&path).unwrap();
+    let health: String = connection
+        .query_row(
+            "SELECT health FROM team_roles
+             WHERE mission_id = 'msn-reconcile-failure-delivery' AND role = 'worker'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let assignment_state: String = connection
+        .query_row(
+            "SELECT state FROM assignments
+             WHERE mission_id = 'msn-reconcile-failure-delivery'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(health, "idle");
+    assert_eq!(assignment_state, "active");
+    assert_eq!(runner.calls.borrow()[0], ["agent", "list"]);
+    assert!(runner
+        .calls
+        .borrow()
+        .iter()
+        .any(|args| args.first().map(String::as_str) == Some("agent")
+            && args.get(1).map(String::as_str) == Some("prompt")));
+
+    cleanup(&path);
 }
 
 #[test]

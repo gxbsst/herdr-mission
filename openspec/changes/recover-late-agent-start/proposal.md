@@ -8,6 +8,8 @@
 - `agent_pane_busy` 后只尝试一次结构化接管；Herdr 0.8.2 无法从结构化状态区分空闲 shell 与无关前台进程时，不在同次调用重复 `agent start`，而是失败关闭并允许显式恢复复用已分配 pane。
 - 在 split 或复用 root pane 后、启动 Agent 前先持久化 pane 分配；完成稳定名称注册后再持久化完整运行时身份，避免恢复时重复 split。
 - 将 Mission 的三个区域名称固定为 `工作区`、`审查`、`验证`，其中所有 Agent 只在 `工作区` 区域启动和恢复。
+- 启动时原子修复已知的历史 `mission_workspace` 字段错位；对于当前 Herdr session 中不可见的持久化区域，返回包含区域身份和底层 Herdr 错误的明确诊断。
+- dashboard 恢复失败时显示结构化错误中的 operation 与底层原因，不再只显示笼统的 `launch_effect_failed`。
 - 为迟到成功、正确 Agent 接管、无关占用拒绝、pane 分配恢复和三个区域名称收敛增加回归测试。
 - 将插件版本提升到 `0.1.2`，通过现有 tag 工作流发布三平台预编译二进制、校验文件和 commit marker。
 

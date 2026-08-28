@@ -16,7 +16,7 @@ herdr plugin install gxbsst/herdr-mission --yes
 
 ## 前置依赖
 
-- [herdr](https://herdr.dev) ≥ 0.7.5
+- [herdr](https://herdr.dev) ≥ 0.8.0
 - 有预编译二进制时无需 Rust；仅当回退源码编译时才需要 Rust 1.88.0
 - [mise](https://mise.jdx.dev) + Rust 1.88.0（`mise use rust@1.88.0`），仅在本地构建/回退编译时需要
 
@@ -53,6 +53,7 @@ init        读取角色待办与收件箱
 send        派发 Assignment 给目标角色
 reply       回执 Assignment
 deliver     投递 outbox
+reconcile   协调 Agent 实时状态并投递 outbox
 start-role  按需启动一个角色
 join        手动把当前 agent 加入为某角色
 resume      恢复未启动的角色
@@ -116,7 +117,6 @@ src/           Rust 源码（kernel、store、runtime、TUI、CLI）
 tests/         集成测试与 schema fixture
 prompts/roles/ 每个角色的启动 prompt
 actions/       herdr action 脚本
-events/        herdr 事件脚本（投递 reconcile）
 panes/         herdr pane（Mission 看板）
 ```
 

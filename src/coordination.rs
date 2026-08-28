@@ -17,11 +17,13 @@ use std::{
 use rusqlite::OptionalExtension;
 use serde_json::json;
 
+use crate::creation::reconcile_role_healths_with;
 use crate::{
-    open_writable, parse_role_ref, read_generation, utc_timestamp, AgentProviderAdapter,
-    AssignmentState, DecisionContext, DriveExecutionMode, DriveRequest, ErrorCategory, Generation,
-    HandleDisposition, HandleInput, InspectQuery, KernelError, KernelInput, MissionKernel,
-    ProcessRunner, RoleRuntimeConfig, RuntimeOwner, OWNER_IDENTITY,
+    agent_list_argv, open_writable, parse_agent_list, parse_role_ref, read_generation,
+    utc_timestamp, AgentProviderAdapter, AssignmentState, DecisionContext, DriveExecutionMode,
+    DriveRequest, ErrorCategory, Generation, HandleDisposition, HandleInput, InspectQuery,
+    KernelError, KernelInput, MissionKernel, ProcessRunner, RoleHealthReconciliation,
+    RoleRuntimeConfig, RuntimeOwner, OWNER_IDENTITY,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +59,13 @@ pub struct RoleContext {
 pub struct DeliveryReport {
     pub delivered: u32,
     pub failed: u32,
+}
+
+/// Independent results from one event-driven health and delivery pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconcileReport {
+    pub health: Result<RoleHealthReconciliation, KernelError>,
+    pub delivery: Result<DeliveryReport, KernelError>,
 }
 
 /// Result of dispatching a command through the kernel state machine.
@@ -513,6 +522,38 @@ pub fn kernel_deliver(
         report.failed += drive.pending + drive.retryable_failures + drive.terminal_failures;
     }
     Ok(report)
+}
+
+/// Reconcile persisted role health from Herdr Core, then always attempt one
+/// delivery pass even when the Core snapshot is unavailable or invalid.
+pub fn kernel_reconcile(
+    database: &Path,
+    runner: &dyn ProcessRunner,
+    herdr: &str,
+) -> ReconcileReport {
+    let health =
+        reconcile_role_healths_with(database, || match runner.run(herdr, &agent_list_argv()) {
+            Ok(output) if output.exit_code == 0 => parse_agent_list(&output.stdout),
+            Ok(output) => Err(KernelError {
+                category: ErrorCategory::Infrastructure,
+                code: "herdr_agent_list_failed".into(),
+                message: "herdr agent list exited non-zero".into(),
+                retryable: true,
+                details: BTreeMap::from([
+                    ("exit_code".into(), json!(output.exit_code)),
+                    ("stderr".into(), json!(output.stderr)),
+                ]),
+            }),
+            Err(error) => Err(KernelError {
+                category: ErrorCategory::Infrastructure,
+                code: "herdr_agent_list_spawn_failed".into(),
+                message: "failed to run herdr agent list".into(),
+                retryable: true,
+                details: BTreeMap::from([("reason".into(), json!(error.to_string()))]),
+            }),
+        });
+    let delivery = kernel_deliver(database, runner, herdr);
+    ReconcileReport { health, delivery }
 }
 
 fn queued_mission_ids(database: &Path) -> Result<Vec<String>, KernelError> {
