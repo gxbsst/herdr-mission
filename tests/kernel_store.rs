@@ -771,13 +771,28 @@ fn queued_reviewer_follow_up_waits_for_active_capacity_before_delivery() {
     }
     drop(connection);
 
-    kernel_dispatch_command(
+    let runner = FakeRunner {
+        calls: RefCell::new(Vec::new()),
+    };
+    let held_worker = kernel_dispatch_command(
         &path,
         mission_id,
         "pm",
-        "reviewer",
-        "review",
-        "review the other work",
+        "worker",
+        "task",
+        "produce the review that holds Reviewer capacity",
+    )
+    .unwrap()
+    .assignment_id
+    .unwrap();
+    kernel_deliver(&path, &runner, "herdr").unwrap();
+    kernel_reply_command(
+        &path,
+        mission_id,
+        "worker",
+        &held_worker,
+        "completed",
+        "first review is ready",
     )
     .unwrap();
     let held_review = kernel_read_context(&path, mission_id, "reviewer")
@@ -785,9 +800,6 @@ fn queued_reviewer_follow_up_waits_for_active_capacity_before_delivery() {
         .pending_assignments[0]
         .id
         .clone();
-    let runner = FakeRunner {
-        calls: RefCell::new(Vec::new()),
-    };
     kernel_deliver(&path, &runner, "herdr").unwrap();
 
     let worker = kernel_dispatch_command(
@@ -1021,13 +1033,13 @@ fn deferred_drive_claims_only_one_queued_singleton_assignment() {
     }
     drop(connection);
 
-    let worker = kernel_dispatch_command(
+    let first_worker = kernel_dispatch_command(
         &path,
         mission_id,
         "pm",
         "worker",
         "task",
-        "complete after a review is already queued",
+        "create the first queued review",
     )
     .unwrap()
     .assignment_id
@@ -1036,20 +1048,52 @@ fn deferred_drive_claims_only_one_queued_singleton_assignment() {
         calls: RefCell::new(Vec::new()),
     };
     kernel_deliver(&path, &runner, "herdr").unwrap();
-    kernel_dispatch_command(
-        &path,
-        mission_id,
-        "pm",
-        "reviewer",
-        "review",
-        "first queued review",
-    )
-    .unwrap();
     kernel_reply_command(
         &path,
         mission_id,
         "worker",
-        &worker,
+        &first_worker,
+        "completed",
+        "first queued review",
+    )
+    .unwrap();
+
+    let second_worker = kernel_dispatch_command(
+        &path,
+        mission_id,
+        "pm",
+        "worker",
+        "task",
+        "create the second queued review",
+    )
+    .unwrap()
+    .assignment_id
+    .unwrap();
+    // Activate only the Worker fixture so both automatic Reviews remain queued
+    // for the deferred-drive singleton serialization assertion below.
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE assignments SET state = 'active' WHERE id = ?1",
+            [&second_worker],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE outbox SET status = 'delivered'
+             WHERE message_id IN (
+                 SELECT id FROM messages
+                 WHERE assignment_id = ?1 AND source_role = 'pm'
+             )",
+            [&second_worker],
+        )
+        .unwrap();
+    drop(connection);
+    kernel_reply_command(
+        &path,
+        mission_id,
+        "worker",
+        &second_worker,
         "completed",
         "second queued review",
     )

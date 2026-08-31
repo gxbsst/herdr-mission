@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,7 +19,7 @@ use serde_json::json;
 use crate::herdr::AgentSnapshot;
 use crate::{
     bootstrap_database, open_writable, read_generation, ErrorCategory, KernelError, LaunchMode,
-    OWNER_IDENTITY,
+    MissionWorkspace, OWNER_IDENTITY,
 };
 
 pub const TEAM_ROLES: [&str; 4] = ["pm", "worker", "scout", "reviewer"];
@@ -327,6 +328,51 @@ pub struct RoleRuntimeRow {
     pub thinking: String,
     pub pane_id: String,
     pub agent_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoleLaunchLeaseSnapshot {
+    owner: String,
+    generation: String,
+    acquired_at: i64,
+    expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoleRuntimeBindingSnapshot {
+    pub pane_id: String,
+    pub agent_name: String,
+    pub session_json: Option<String>,
+    pub launch_generation: String,
+    pub health: String,
+    pub last_seen_rev: i64,
+    updated_at: String,
+    lease: Option<RoleLaunchLeaseSnapshot>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RoleRuntimeReplacementStageError {
+    pub error: KernelError,
+    pub pane_id: Option<String>,
+    pub fenced: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct RoleRuntimeSplitFailure {
+    pub error: KernelError,
+    pub effect_uncertain: bool,
+}
+
+impl RoleRuntimeBindingSnapshot {
+    pub(crate) fn is_staged_replacement_for(&self, pane_id: &str) -> bool {
+        !pane_id.is_empty()
+            && self.pane_id == pane_id
+            && self.agent_name.is_empty()
+            && self.session_json.is_none()
+            && self.health == "starting"
+            && self.last_seen_rev == 0
+            && self.lease.is_none()
+    }
 }
 
 /// Summary of one complete Agent snapshot applied to persisted role bindings.
@@ -992,6 +1038,569 @@ pub fn read_role_runtime(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| sqlite_error("sqlite_roles_read_failed", "read_role_runtime", error))?;
     Ok(rows)
+}
+
+pub(crate) fn read_role_runtime_binding(
+    database: &Path,
+    mission_id: &str,
+    role: &str,
+) -> Result<RoleRuntimeBindingSnapshot, KernelError> {
+    let connection = open_writable(database, OWNER_IDENTITY)?;
+    query_role_runtime_binding(&connection, mission_id, role)?.ok_or_else(|| KernelError {
+        category: ErrorCategory::Domain,
+        code: "role_not_found".into(),
+        message: "Mission role is not present".into(),
+        retryable: false,
+        details: BTreeMap::from([
+            ("mission_id".into(), json!(mission_id)),
+            ("role".into(), json!(role)),
+        ]),
+    })
+}
+
+pub(crate) fn stage_role_runtime_replacement(
+    database: &Path,
+    mission_id: &str,
+    role: &str,
+    expected: &RoleRuntimeBindingSnapshot,
+    expected_workspace: &MissionWorkspace,
+    split: impl FnOnce() -> Result<String, RoleRuntimeSplitFailure>,
+) -> Result<RoleRuntimeBindingSnapshot, RoleRuntimeReplacementStageError> {
+    let mut connection = open_writable(database, OWNER_IDENTITY)?;
+    let mut transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_begin_failed",
+                "stage_role_runtime_replacement",
+                error,
+            )
+        })?;
+    let workspace_matches =
+        role_replacement_workspace_matches(&transaction, mission_id, expected_workspace)?;
+    let current = query_role_runtime_binding(&transaction, mission_id, role)?;
+    if !workspace_matches || current.as_ref() != Some(expected) {
+        return Err(role_replacement_cas_failed(mission_id, role).into());
+    }
+    if expected.pane_id.is_empty() {
+        return Err(role_replacement_cas_failed(mission_id, role).into());
+    }
+    if expected
+        .lease
+        .as_ref()
+        .is_some_and(|lease| lease.expires_at > unix_seconds())
+    {
+        return Err(role_replacement_lease_busy(mission_id, role).into());
+    }
+
+    let mut generation = None;
+    for _ in 0..16 {
+        let candidate = next_role_runtime_generation(role);
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM team_roles WHERE launch_generation = ?1
+                     UNION ALL
+                     SELECT 1 FROM role_launch_leases WHERE generation = ?1
+                 )",
+                [&candidate],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| {
+                sqlite_error(
+                    "sqlite_role_read_failed",
+                    "verify_role_replacement_generation",
+                    error,
+                )
+            })?;
+        if !exists && candidate != expected.launch_generation {
+            generation = Some(candidate);
+            break;
+        }
+    }
+    let generation = generation
+        .ok_or_else(|| role_replacement_generation_exhausted(mission_id, role))
+        .map_err(RoleRuntimeReplacementStageError::from)?;
+    // Keep the IMMEDIATE transaction across the one split and the staged CAS.
+    // A concurrent recovery cannot steal an expired wall-clock lease, while a
+    // crashed process releases the SQLite lock automatically.
+    let pane_id = match split() {
+        Ok(pane_id) => pane_id,
+        Err(failure) if failure.effect_uncertain => {
+            if let Err(error) = install_role_replacement_fence(
+                &transaction,
+                mission_id,
+                role,
+                expected,
+                &generation,
+            ) {
+                return Err(RoleRuntimeReplacementStageError {
+                    error,
+                    pane_id: None,
+                    fenced: false,
+                });
+            }
+            if let Err(error) = transaction.commit().map_err(|error| {
+                sqlite_error(
+                    "sqlite_commit_failed",
+                    "fence_uncertain_role_runtime_replacement",
+                    error,
+                )
+            }) {
+                return Err(RoleRuntimeReplacementStageError {
+                    error,
+                    pane_id: None,
+                    fenced: false,
+                });
+            }
+            return Err(RoleRuntimeReplacementStageError {
+                error: failure.error,
+                pane_id: None,
+                fenced: true,
+            });
+        }
+        Err(failure) => {
+            return Err(RoleRuntimeReplacementStageError {
+                error: failure.error,
+                pane_id: None,
+                fenced: false,
+            });
+        }
+    };
+    if pane_id.is_empty() || pane_id == expected.pane_id {
+        let error = role_replacement_cas_failed(mission_id, role);
+        install_role_replacement_fence(&transaction, mission_id, role, expected, &generation)
+            .map_err(RoleRuntimeReplacementStageError::from)?;
+        transaction
+            .commit()
+            .map_err(|commit_error| {
+                sqlite_error(
+                    "sqlite_commit_failed",
+                    "fence_invalid_role_runtime_replacement",
+                    commit_error,
+                )
+            })
+            .map_err(RoleRuntimeReplacementStageError::from)?;
+        return Err(RoleRuntimeReplacementStageError {
+            error,
+            pane_id: Some(pane_id),
+            fenced: true,
+        });
+    }
+    let now = utc_timestamp();
+    let staged = (|| -> Result<RoleRuntimeBindingSnapshot, KernelError> {
+        let savepoint = transaction.savepoint().map_err(|error| {
+            sqlite_error(
+                "sqlite_begin_failed",
+                "savepoint_role_runtime_replacement",
+                error,
+            )
+        })?;
+        let updated = savepoint
+            .execute(
+                "UPDATE team_roles
+             SET pane_id = ?1, terminal_id = '', session_json = NULL,
+                 launch_generation = ?2, health = 'starting', last_seen_rev = 0,
+                 updated_at = ?3
+             WHERE mission_id = ?4 AND role = ?5
+               AND pane_id = ?6 AND terminal_id = ?7
+               AND session_json IS ?8 AND launch_generation = ?9
+               AND health = ?10 AND last_seen_rev = ?11 AND updated_at = ?12",
+                rusqlite::params![
+                    pane_id,
+                    generation,
+                    now,
+                    mission_id,
+                    role,
+                    expected.pane_id,
+                    expected.agent_name,
+                    expected.session_json,
+                    expected.launch_generation,
+                    expected.health,
+                    expected.last_seen_rev,
+                    expected.updated_at,
+                ],
+            )
+            .map_err(|error| {
+                sqlite_error(
+                    "sqlite_role_update_failed",
+                    "stage_role_runtime_replacement",
+                    error,
+                )
+            })?;
+        if updated != 1 {
+            Err(role_replacement_cas_failed(mission_id, role))
+        } else {
+            let deleted = savepoint
+                .execute(
+                    "DELETE FROM role_launch_leases WHERE mission_id = ?1 AND role = ?2",
+                    rusqlite::params![mission_id, role],
+                )
+                .map_err(|error| {
+                    sqlite_error(
+                        "sqlite_role_update_failed",
+                        "stage_role_runtime_replacement",
+                        error,
+                    )
+                })?;
+            if deleted != usize::from(expected.lease.is_some()) {
+                Err(role_replacement_cas_failed(mission_id, role))
+            } else {
+                savepoint.commit().map_err(|error| {
+                    sqlite_error(
+                        "sqlite_commit_failed",
+                        "savepoint_role_runtime_replacement",
+                        error,
+                    )
+                })?;
+                Ok(RoleRuntimeBindingSnapshot {
+                    pane_id: pane_id.clone(),
+                    agent_name: String::new(),
+                    session_json: None,
+                    launch_generation: generation.clone(),
+                    health: "starting".into(),
+                    last_seen_rev: 0,
+                    updated_at: now,
+                    lease: None,
+                })
+            }
+        }
+    })();
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            install_role_replacement_fence(&transaction, mission_id, role, expected, &generation)
+                .map_err(RoleRuntimeReplacementStageError::from)?;
+            transaction
+                .commit()
+                .map_err(|commit_error| {
+                    sqlite_error(
+                        "sqlite_commit_failed",
+                        "fence_failed_role_runtime_replacement",
+                        commit_error,
+                    )
+                })
+                .map_err(RoleRuntimeReplacementStageError::from)?;
+            return Err(RoleRuntimeReplacementStageError {
+                error,
+                pane_id: Some(pane_id),
+                fenced: true,
+            });
+        }
+    };
+    transaction
+        .commit()
+        .map_err(|error| RoleRuntimeReplacementStageError {
+            error: sqlite_error(
+                "sqlite_commit_failed",
+                "stage_role_runtime_replacement",
+                error,
+            ),
+            pane_id: Some(staged.pane_id.clone()),
+            fenced: false,
+        })?;
+    Ok(staged)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_role_runtime_replacement(
+    database: &Path,
+    mission_id: &str,
+    role: &str,
+    expected: &RoleRuntimeBindingSnapshot,
+    expected_workspace: &MissionWorkspace,
+    agent_name: &str,
+) -> Result<String, KernelError> {
+    let mut connection = open_writable(database, OWNER_IDENTITY)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_begin_failed",
+                "finalize_role_runtime_replacement",
+                error,
+            )
+        })?;
+    let workspace_matches =
+        role_replacement_workspace_matches(&transaction, mission_id, expected_workspace)?;
+    let current = query_role_runtime_binding(&transaction, mission_id, role)?;
+    if !workspace_matches
+        || current.as_ref() != Some(expected)
+        || !expected.is_staged_replacement_for(&expected.pane_id)
+        || agent_name.is_empty()
+    {
+        return Err(role_replacement_cas_failed(mission_id, role));
+    }
+    let now = utc_timestamp();
+    let updated = transaction
+        .execute(
+            "UPDATE team_roles
+             SET terminal_id = ?1, health = 'idle', updated_at = ?2
+             WHERE mission_id = ?3 AND role = ?4
+               AND pane_id = ?5 AND terminal_id = ?6
+               AND session_json IS ?7 AND launch_generation = ?8
+               AND health = ?9 AND last_seen_rev = ?10 AND updated_at = ?11",
+            rusqlite::params![
+                agent_name,
+                now,
+                mission_id,
+                role,
+                expected.pane_id,
+                expected.agent_name,
+                expected.session_json,
+                expected.launch_generation,
+                expected.health,
+                expected.last_seen_rev,
+                expected.updated_at,
+            ],
+        )
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_role_update_failed",
+                "finalize_role_runtime_replacement",
+                error,
+            )
+        })?;
+    if updated != 1 {
+        return Err(role_replacement_cas_failed(mission_id, role));
+    }
+    transaction.commit().map_err(|error| {
+        sqlite_error(
+            "sqlite_commit_failed",
+            "finalize_role_runtime_replacement",
+            error,
+        )
+    })?;
+    Ok(expected.launch_generation.clone())
+}
+
+pub(crate) fn fence_unstaged_role_runtime_replacement(
+    database: &Path,
+    mission_id: &str,
+    role: &str,
+    expected: &RoleRuntimeBindingSnapshot,
+    expected_workspace: &MissionWorkspace,
+) -> Result<(), KernelError> {
+    let mut connection = open_writable(database, OWNER_IDENTITY)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_begin_failed",
+                "fence_unstaged_role_runtime_replacement",
+                error,
+            )
+        })?;
+    let workspace_matches =
+        role_replacement_workspace_matches(&transaction, mission_id, expected_workspace)?;
+    let current = query_role_runtime_binding(&transaction, mission_id, role)?;
+    if !workspace_matches || current.as_ref() != Some(expected) {
+        return Err(role_replacement_cas_failed(mission_id, role));
+    }
+    let generation = next_role_runtime_generation(role);
+    install_role_replacement_fence(&transaction, mission_id, role, expected, &generation)?;
+    transaction.commit().map_err(|error| {
+        sqlite_error(
+            "sqlite_commit_failed",
+            "fence_unstaged_role_runtime_replacement",
+            error,
+        )
+    })
+}
+
+fn install_role_replacement_fence(
+    connection: &rusqlite::Connection,
+    mission_id: &str,
+    role: &str,
+    expected: &RoleRuntimeBindingSnapshot,
+    generation: &str,
+) -> Result<(), KernelError> {
+    let deleted = connection
+        .execute(
+            "DELETE FROM role_launch_leases WHERE mission_id = ?1 AND role = ?2",
+            rusqlite::params![mission_id, role],
+        )
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_role_update_failed",
+                "fence_unstaged_role_runtime_replacement",
+                error,
+            )
+        })?;
+    if deleted != usize::from(expected.lease.is_some()) {
+        return Err(role_replacement_cas_failed(mission_id, role));
+    }
+    connection
+        .execute(
+            "INSERT INTO role_launch_leases(
+                 mission_id, role, owner, generation, acquired_at, expires_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                mission_id,
+                role,
+                format!("role-runtime-replacement-fence:{generation}"),
+                generation,
+                unix_seconds(),
+                i64::MAX,
+            ],
+        )
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_role_update_failed",
+                "fence_unstaged_role_runtime_replacement",
+                error,
+            )
+        })?;
+    Ok(())
+}
+
+fn query_role_runtime_binding(
+    connection: &rusqlite::Connection,
+    mission_id: &str,
+    role: &str,
+) -> Result<Option<RoleRuntimeBindingSnapshot>, KernelError> {
+    connection
+        .query_row(
+            "SELECT r.pane_id, r.terminal_id, r.session_json, r.launch_generation,
+                    r.health, r.last_seen_rev, r.updated_at,
+                    l.owner, l.generation, l.acquired_at, l.expires_at
+             FROM team_roles AS r
+             LEFT JOIN role_launch_leases AS l
+               ON l.mission_id = r.mission_id AND l.role = r.role
+             WHERE r.mission_id = ?1 AND r.role = ?2",
+            rusqlite::params![mission_id, role],
+            |row| {
+                let owner = row.get::<_, Option<String>>(7)?;
+                let lease = match owner {
+                    Some(owner) => Some(RoleLaunchLeaseSnapshot {
+                        owner,
+                        generation: row.get(8)?,
+                        acquired_at: row.get(9)?,
+                        expires_at: row.get(10)?,
+                    }),
+                    None => None,
+                };
+                Ok(RoleRuntimeBindingSnapshot {
+                    pane_id: row.get(0)?,
+                    agent_name: row.get(1)?,
+                    session_json: row.get(2)?,
+                    launch_generation: row.get(3)?,
+                    health: row.get(4)?,
+                    last_seen_rev: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    lease,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_role_read_failed",
+                "read_role_runtime_binding",
+                error,
+            )
+        })
+}
+
+fn role_replacement_workspace_matches(
+    connection: &rusqlite::Connection,
+    mission_id: &str,
+    expected: &MissionWorkspace,
+) -> Result<bool, KernelError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM mission_workspace
+                 WHERE mission_id = ?1 AND source = ?2 AND workspace_id = ?3
+                   AND tab_id = ?4 AND root_pane_id = ?5 AND execution_tab_id = ?6
+                   AND review_tab_id = ?7 AND verification_tab_id = ?8
+                   AND worktree_path = ?9 AND branch = ?10
+             )",
+            rusqlite::params![
+                mission_id,
+                expected.source.as_str(),
+                expected.workspace_id,
+                expected.tab_id,
+                expected.root_pane_id,
+                expected.execution_tab_id,
+                expected.review_tab_id,
+                expected.verification_tab_id,
+                expected.worktree_path,
+                expected.branch,
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| {
+            sqlite_error(
+                "sqlite_role_read_failed",
+                "verify_role_replacement_workspace",
+                error,
+            )
+        })
+}
+
+impl From<KernelError> for RoleRuntimeReplacementStageError {
+    fn from(error: KernelError) -> Self {
+        Self {
+            error,
+            pane_id: None,
+            fenced: false,
+        }
+    }
+}
+
+static ROLE_RUNTIME_GENERATION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_role_runtime_generation(_role: &str) -> String {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let sequence = ROLE_RUNTIME_GENERATION_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "runtime-{:x}-{:08x}-{:x}-{sequence:x}",
+        duration.as_secs(),
+        duration.subsec_nanos(),
+        std::process::id(),
+    )
+}
+
+fn role_replacement_cas_failed(mission_id: &str, role: &str) -> KernelError {
+    KernelError {
+        category: ErrorCategory::Domain,
+        code: "role_runtime_replacement_conflict".into(),
+        message: "role runtime binding changed before pane replacement could be committed".into(),
+        retryable: true,
+        details: BTreeMap::from([
+            ("mission_id".into(), json!(mission_id)),
+            ("role".into(), json!(role)),
+        ]),
+    }
+}
+
+fn role_replacement_lease_busy(mission_id: &str, role: &str) -> KernelError {
+    KernelError {
+        category: ErrorCategory::Domain,
+        code: "role_runtime_replacement_busy".into(),
+        message: "another live role launch lease owns this role".into(),
+        retryable: true,
+        details: BTreeMap::from([
+            ("mission_id".into(), json!(mission_id)),
+            ("role".into(), json!(role)),
+        ]),
+    }
+}
+
+fn role_replacement_generation_exhausted(mission_id: &str, role: &str) -> KernelError {
+    KernelError {
+        category: ErrorCategory::Infrastructure,
+        code: "role_runtime_generation_exhausted".into(),
+        message: "could not allocate a unique role runtime generation".into(),
+        retryable: true,
+        details: BTreeMap::from([
+            ("mission_id".into(), json!(mission_id)),
+            ("role".into(), json!(role)),
+        ]),
+    }
 }
 
 /// Persist the pane allocated to a role before starting its Agent.

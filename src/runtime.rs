@@ -16,6 +16,10 @@ use std::{
 
 use serde_json::{json, Value};
 
+use crate::creation::{
+    fence_unstaged_role_runtime_replacement, finalize_role_runtime_replacement,
+    read_role_runtime_binding, stage_role_runtime_replacement, RoleRuntimeSplitFailure,
+};
 use crate::{
     agent_name_token, agent_rename_argv, agent_start_args, git_head, git_root, pane_get_argv,
     pane_list_argv, pane_move_to_tab_argv, pane_rename_argv, pane_run_argv, pane_split_in_argv,
@@ -112,12 +116,40 @@ pub fn launch_mission(
     for row in &roles {
         let agent_name = format!("mission-{token}-{}", row.role);
         if !row.pane_id.is_empty() && !row.agent_name.is_empty() {
-            reconcile_completed_role(runner, herdr, row, &agent_name, &workspace, &role_cwd)
-                .map_err(|error| blocked(database, mission_id, error))?;
-            progress(&format!("跳过已启动的 {role}", role = row.role));
+            let reconciliation =
+                reconcile_completed_role(runner, herdr, row, &agent_name, &workspace, &role_cwd)
+                    .map_err(|error| blocked(database, mission_id, error))?;
+            match reconciliation {
+                CompletedRoleReconciliation::Reused => {
+                    progress(&format!("跳过已启动的 {role}", role = row.role));
+                }
+                CompletedRoleReconciliation::Missing => {
+                    let replacement = replace_missing_role_runtime(
+                        database,
+                        mission_id,
+                        row,
+                        &workspace,
+                        &role_cwd,
+                        &title,
+                        launch_mode,
+                        options.prompts_dir.as_deref(),
+                        &options.direction,
+                        None,
+                        runner,
+                        herdr,
+                        progress,
+                    )
+                    .map_err(|error| blocked(database, mission_id, error))?;
+                    launched.push(replacement);
+                }
+            }
             continue;
         }
-        if !is_simple && launch_mode == LaunchMode::Manual && row.role != "pm" {
+        if !is_simple
+            && launch_mode == LaunchMode::Manual
+            && row.role != "pm"
+            && row.pane_id.is_empty()
+        {
             progress(&format!(
                 "manual 模式：跳过 {role}（等待 PM 按需启动）",
                 role = row.role
@@ -127,9 +159,35 @@ pub fn launch_mission(
         progress(&format!("启动 {role} ...", role = row.role));
 
         let pane_id = if !row.pane_id.is_empty() {
-            validate_work_region_pane(runner, herdr, &row.pane_id, &workspace, &role_cwd)
-                .map_err(|error| blocked(database, mission_id, error))?;
-            row.pane_id.clone()
+            match get_pane_with_visibility_retry(runner, herdr, &row.pane_id)
+                .map_err(|error| blocked(database, mission_id, error))?
+            {
+                PaneLookup::Found(_) => {
+                    validate_work_region_pane(runner, herdr, &row.pane_id, &workspace, &role_cwd)
+                        .map_err(|error| blocked(database, mission_id, error))?;
+                    row.pane_id.clone()
+                }
+                PaneLookup::Missing(_) => {
+                    let replacement = replace_missing_role_runtime(
+                        database,
+                        mission_id,
+                        row,
+                        &workspace,
+                        &role_cwd,
+                        &title,
+                        launch_mode,
+                        options.prompts_dir.as_deref(),
+                        &options.direction,
+                        None,
+                        runner,
+                        herdr,
+                        progress,
+                    )
+                    .map_err(|error| blocked(database, mission_id, error))?;
+                    launched.push(replacement);
+                    continue;
+                }
+            }
         } else if is_simple || row.role == "pm" {
             workspace.root_pane_id.clone()
         } else {
@@ -152,6 +210,15 @@ pub fn launch_mission(
                 Ok(pane) => pane.pane_id,
                 Err(error) => return Err(blocked(database, mission_id, error)),
             }
+        };
+        let staged_replacement = if !row.pane_id.is_empty() {
+            let binding = read_role_runtime_binding(database, mission_id, &row.role)
+                .map_err(|error| blocked(database, mission_id, error))?;
+            binding
+                .is_staged_replacement_for(&pane_id)
+                .then_some(binding)
+        } else {
+            None
         };
         if row.pane_id.is_empty() {
             record_role_pane(database, mission_id, &row.role, &pane_id)
@@ -209,8 +276,20 @@ pub fn launch_mission(
         ensure_agent_running(runner, herdr, !row.pane_id.is_empty(), &command, &recovery)
             .map_err(|error| blocked(database, mission_id, error))?;
 
-        record_role_runtime(database, mission_id, &row.role, &pane_id, &agent_name)
+        if let Some(staged) = staged_replacement {
+            finalize_role_runtime_replacement(
+                database,
+                mission_id,
+                &row.role,
+                &staged,
+                &workspace,
+                &agent_name,
+            )
             .map_err(|error| blocked(database, mission_id, error))?;
+        } else {
+            record_role_runtime(database, mission_id, &row.role, &pane_id, &agent_name)
+                .map_err(|error| blocked(database, mission_id, error))?;
+        }
         // Rename after the agent is started so the descriptive label wins over
         // any agent-detected branding: "⚑ <mission title> › <role label>".
         let pane_label = format!("⚑ {title} › {}", role_label(&row.role));
@@ -276,10 +355,6 @@ pub fn start_role(
         .iter()
         .find(|row| row.role == role)
         .ok_or_else(|| role_not_found(mission_id, role))?;
-    if !row.pane_id.is_empty() && !row.agent_name.is_empty() {
-        progress(&format!("{role} 已启动，跳过"));
-        return Ok(None);
-    }
 
     let title = read_mission_title(database, mission_id)?;
     let launch_mode = read_mission_launch_mode(database, mission_id)?;
@@ -301,10 +376,38 @@ pub fn start_role(
     validate_workspace_available(runner, herdr, &workspace.workspace_id)
         .map_err(|error| blocked(database, mission_id, error))?;
     let role_cwd = mission_worktree(&workspace, cwd).to_string();
-    validate_work_region_pane(runner, herdr, anchor_pane_id, &workspace, &role_cwd)
-        .map_err(|error| blocked(database, mission_id, error))?;
+    if !row.pane_id.is_empty() && !row.agent_name.is_empty() {
+        let reconciliation =
+            reconcile_completed_role(runner, herdr, row, &agent_name, &workspace, &role_cwd)
+                .map_err(|error| blocked(database, mission_id, error))?;
+        return match reconciliation {
+            CompletedRoleReconciliation::Reused => {
+                progress(&format!("{role} 已启动，跳过"));
+                Ok(None)
+            }
+            CompletedRoleReconciliation::Missing => replace_missing_role_runtime(
+                database,
+                mission_id,
+                row,
+                &workspace,
+                &role_cwd,
+                &title,
+                launch_mode,
+                prompts_dir,
+                "right",
+                Some(anchor_pane_id),
+                runner,
+                herdr,
+                progress,
+            )
+            .map(Some)
+            .map_err(|error| blocked(database, mission_id, error)),
+        };
+    }
 
     let pane_id = if row.pane_id.is_empty() {
+        validate_work_region_pane(runner, herdr, anchor_pane_id, &workspace, &role_cwd)
+            .map_err(|error| blocked(database, mission_id, error))?;
         let split = run(
             runner,
             herdr,
@@ -325,9 +428,43 @@ pub fn start_role(
             .map_err(|error| blocked(database, mission_id, error))?;
         pane_id
     } else {
-        validate_work_region_pane(runner, herdr, &row.pane_id, &workspace, &role_cwd)
+        match get_pane_with_visibility_retry(runner, herdr, &row.pane_id)
+            .map_err(|error| blocked(database, mission_id, error))?
+        {
+            PaneLookup::Found(_) => {
+                validate_work_region_pane(runner, herdr, &row.pane_id, &workspace, &role_cwd)
+                    .map_err(|error| blocked(database, mission_id, error))?;
+                row.pane_id.clone()
+            }
+            PaneLookup::Missing(_) => {
+                return replace_missing_role_runtime(
+                    database,
+                    mission_id,
+                    row,
+                    &workspace,
+                    &role_cwd,
+                    &title,
+                    launch_mode,
+                    prompts_dir,
+                    "right",
+                    Some(anchor_pane_id),
+                    runner,
+                    herdr,
+                    progress,
+                )
+                .map(Some)
+                .map_err(|error| blocked(database, mission_id, error));
+            }
+        }
+    };
+    let staged_replacement = if !row.pane_id.is_empty() {
+        let binding = read_role_runtime_binding(database, mission_id, role)
             .map_err(|error| blocked(database, mission_id, error))?;
-        row.pane_id.clone()
+        binding
+            .is_staged_replacement_for(&pane_id)
+            .then_some(binding)
+    } else {
+        None
     };
 
     let mut argv = agent_start_args(&row.provider, None)
@@ -373,8 +510,20 @@ pub fn start_role(
     };
     ensure_agent_running(runner, herdr, !row.pane_id.is_empty(), &command, &recovery)
         .map_err(|error| blocked(database, mission_id, error))?;
-    record_role_runtime(database, mission_id, role, &pane_id, &agent_name)
+    if let Some(staged) = staged_replacement {
+        finalize_role_runtime_replacement(
+            database,
+            mission_id,
+            role,
+            &staged,
+            &workspace,
+            &agent_name,
+        )
         .map_err(|error| blocked(database, mission_id, error))?;
+    } else {
+        record_role_runtime(database, mission_id, role, &pane_id, &agent_name)
+            .map_err(|error| blocked(database, mission_id, error))?;
+    }
 
     let pane_label = format!("⚑ {title} › {}", role_label(role));
     let _ = run(runner, herdr, &pane_rename_argv(&pane_id, &pane_label));
@@ -827,6 +976,236 @@ fn find_unique_stage_pane(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn replace_missing_role_runtime(
+    database: &Path,
+    mission_id: &str,
+    row: &RoleRuntimeRow,
+    workspace: &MissionWorkspace,
+    cwd: &str,
+    title: &str,
+    launch_mode: LaunchMode,
+    prompts_dir: Option<&Path>,
+    direction: &str,
+    preferred_anchor: Option<&str>,
+    runner: &dyn ProcessRunner,
+    herdr: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<LaunchedRole, KernelError> {
+    let expected = read_role_runtime_binding(database, mission_id, &row.role)?;
+    if expected.pane_id != row.pane_id || expected.agent_name != row.agent_name {
+        return Err(runtime_replacement_rejected(
+            mission_id,
+            &row.role,
+            "persisted role binding changed before recovery",
+        ));
+    }
+    let anchor = match preferred_anchor {
+        Some(anchor) => {
+            validate_work_region_pane(runner, herdr, anchor, workspace, cwd)?;
+            anchor.to_string()
+        }
+        None => find_role_replacement_anchor(runner, herdr, workspace, cwd, &row.pane_id)?,
+    };
+    let staged = match stage_role_runtime_replacement(
+        database,
+        mission_id,
+        &row.role,
+        &expected,
+        workspace,
+        || {
+            let split = match run(runner, herdr, &pane_split_in_argv(direction, cwd, &anchor)) {
+                Ok(split) => split,
+                Err(error) => {
+                    return Err(RoleRuntimeSplitFailure {
+                        error,
+                        effect_uncertain: true,
+                    });
+                }
+            };
+            if split.exit_code != 0 {
+                return Err(RoleRuntimeSplitFailure {
+                    error: launch_failed("pane split", &split),
+                    effect_uncertain: false,
+                });
+            }
+            match parse_pane_split(&split.stdout) {
+                Ok(pane) => Ok(pane.pane_id),
+                Err(error) => Err(RoleRuntimeSplitFailure {
+                    error,
+                    effect_uncertain: true,
+                }),
+            }
+        },
+    ) {
+        Ok(staged) => staged,
+        Err(failure) => {
+            if failure.fenced || failure.pane_id.is_none() {
+                return Err(failure.error);
+            }
+            let current = read_role_runtime_binding(database, mission_id, &row.role)?;
+            if failure
+                .pane_id
+                .as_deref()
+                .is_some_and(|pane_id| current.is_staged_replacement_for(pane_id))
+            {
+                return Err(failure.error);
+            }
+            if current != expected {
+                return Err(runtime_replacement_rejected(
+                    mission_id,
+                    &row.role,
+                    "authoritative binding changed after replacement staging failed",
+                ));
+            }
+            fence_unstaged_role_runtime_replacement(
+                database, mission_id, &row.role, &expected, workspace,
+            )?;
+            return Err(failure.error);
+        }
+    };
+    let pane_id = staged.pane_id.clone();
+    validate_work_region_pane(runner, herdr, &pane_id, workspace, cwd)?;
+
+    let agent_name = format!("mission-{}-{}", agent_name_token(mission_id), row.role);
+    let mut argv = agent_start_args(&row.provider, None)?;
+    let database_str = database.to_string_lossy().into_owned();
+    let prompt = role_init_prompt(
+        title,
+        mission_id,
+        &row.role,
+        cwd,
+        launch_mode.as_str(),
+        &database_str,
+        &mission_bin(),
+        prompts_dir,
+    )?;
+    let prompt_path = write_role_prompt(database, mission_id, &row.role, &prompt)?;
+    argv.push(format!(
+        "请读取并严格遵循 {prompt_path} 中的 Mission 运行说明。"
+    ));
+    let mut command = vec![
+        "agent".to_string(),
+        "start".to_string(),
+        agent_name.clone(),
+        "--kind".to_string(),
+        row.provider.clone(),
+        "--pane".to_string(),
+        pane_id.clone(),
+        "--".to_string(),
+    ];
+    command.extend(argv);
+    let recovery = AgentRecoveryTarget {
+        pane_id: &pane_id,
+        agent_name: &agent_name,
+        provider: &row.provider,
+        cwd,
+        workspace_id: &workspace.workspace_id,
+        tab_id: Some(&workspace.execution_tab_id),
+        tab_label: Some(WORK_REGION_NAME),
+    };
+    ensure_agent_running(runner, herdr, false, &command, &recovery)?;
+    finalize_role_runtime_replacement(
+        database,
+        mission_id,
+        &row.role,
+        &staged,
+        workspace,
+        &agent_name,
+    )?;
+
+    let pane_label = format!("⚑ {title} › {}", role_label(&row.role));
+    let _ = run(runner, herdr, &pane_rename_argv(&pane_id, &pane_label));
+    progress(&format!(
+        "✓ {} → {agent_name} @ {pane_id}（已替换缺失 pane）",
+        row.role
+    ));
+    Ok(LaunchedRole {
+        role: row.role.clone(),
+        agent_name,
+        pane_id,
+    })
+}
+
+fn find_role_replacement_anchor(
+    runner: &dyn ProcessRunner,
+    herdr: &str,
+    workspace: &MissionWorkspace,
+    cwd: &str,
+    missing_pane_id: &str,
+) -> Result<String, KernelError> {
+    let output = run(runner, herdr, &pane_list_argv(&workspace.workspace_id))?;
+    if output.exit_code != 0 {
+        return Err(launch_failed("pane list", &output));
+    }
+    let mut candidates = parse_pane_list(&output.stdout)?
+        .into_iter()
+        .filter(|pane| {
+            pane.workspace_id == workspace.workspace_id
+                && pane.tab_id == workspace.execution_tab_id
+                && pane.pane_id != missing_pane_id
+        })
+        .map(|pane| pane.pane_id)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    for pane_id in candidates {
+        match lookup_pane(runner, herdr, &pane_id)? {
+            PaneLookup::Missing(_) => continue,
+            PaneLookup::Found(actual) => {
+                if actual.pane_id != pane_id
+                    || actual.workspace_id != workspace.workspace_id
+                    || actual.tab_id != workspace.execution_tab_id
+                    || !same_path(&actual.cwd, cwd)
+                {
+                    return Err(work_region_rejected(
+                        &pane_id,
+                        &workspace.workspace_id,
+                        &workspace.execution_tab_id,
+                        cwd,
+                        Some(&actual),
+                        "replacement anchor does not belong to the Mission work region",
+                    ));
+                }
+                validate_work_region_pane(runner, herdr, &pane_id, workspace, cwd)?;
+                return Ok(pane_id);
+            }
+        }
+    }
+    Err(KernelError {
+        category: ErrorCategory::Infrastructure,
+        code: "launch_effect_failed".into(),
+        message: "Mission work region has no live pane for role recovery".into(),
+        retryable: true,
+        details: BTreeMap::from([
+            ("operation".into(), json!("pane replacement anchor")),
+            ("workspace_id".into(), json!(workspace.workspace_id)),
+            ("tab_id".into(), json!(workspace.execution_tab_id)),
+            ("missing_pane_id".into(), json!(missing_pane_id)),
+        ]),
+    })
+}
+
+fn runtime_replacement_rejected(mission_id: &str, role: &str, reason: &str) -> KernelError {
+    KernelError {
+        category: ErrorCategory::Domain,
+        code: "role_runtime_replacement_conflict".into(),
+        message: "role runtime pane replacement could not be committed".into(),
+        retryable: true,
+        details: BTreeMap::from([
+            ("mission_id".into(), json!(mission_id)),
+            ("role".into(), json!(role)),
+            ("reason".into(), json!(reason)),
+        ]),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletedRoleReconciliation {
+    Reused,
+    Missing,
+}
+
 fn reconcile_completed_role(
     runner: &dyn ProcessRunner,
     herdr: &str,
@@ -834,9 +1213,11 @@ fn reconcile_completed_role(
     agent_name: &str,
     workspace: &MissionWorkspace,
     cwd: &str,
-) -> Result<(), KernelError> {
-    let output = get_pane_with_visibility_retry(runner, herdr, &row.pane_id)?;
-    let actual = parse_pane_get(&output.stdout)?;
+) -> Result<CompletedRoleReconciliation, KernelError> {
+    let actual = match get_pane_with_visibility_retry(runner, herdr, &row.pane_id)? {
+        PaneLookup::Found(pane) => pane,
+        PaneLookup::Missing(_) => return Ok(CompletedRoleReconciliation::Missing),
+    };
     let expected = AgentRecoveryTarget {
         pane_id: &row.pane_id,
         agent_name,
@@ -879,7 +1260,7 @@ fn reconcile_completed_role(
             "completed role Agent identity is not available",
         ));
     }
-    Ok(())
+    Ok(CompletedRoleReconciliation::Reused)
 }
 
 fn ensure_named_tab(
@@ -991,8 +1372,10 @@ fn validate_work_region_pane(
         retryable: false,
         details: BTreeMap::from([("operation".into(), json!("work region validation"))]),
     })?;
-    let output = get_pane_with_visibility_retry(runner, herdr, pane_id)?;
-    let pane = parse_pane_get(&output.stdout)?;
+    let pane = match get_pane_with_visibility_retry(runner, herdr, pane_id)? {
+        PaneLookup::Found(pane) => pane,
+        PaneLookup::Missing(output) => return Err(launch_failed("pane get", &output)),
+    };
     if pane.pane_id != pane_id
         || pane.workspace_id != workspace.workspace_id
         || pane.tab_id != expected_tab_id
@@ -1077,6 +1460,12 @@ enum AgentAdoption {
     Empty,
     PendingSession,
     Adopted,
+}
+
+#[derive(Debug)]
+enum PaneLookup {
+    Found(PaneInfo),
+    Missing(ProcessOutput),
 }
 
 fn ensure_agent_running(
@@ -1170,9 +1559,10 @@ fn adopt_running_agent(
     herdr: &str,
     expected: &AgentRecoveryTarget<'_>,
 ) -> Result<AgentAdoption, KernelError> {
-    let output = get_pane_with_visibility_retry(runner, herdr, expected.pane_id)?;
-    let actual = parse_pane_get(&output.stdout)
-        .map_err(|error| recovery_rejected(expected, None, error.message))?;
+    let actual = match get_pane_with_visibility_retry(runner, herdr, expected.pane_id)? {
+        PaneLookup::Found(pane) => pane,
+        PaneLookup::Missing(output) => return Err(launch_failed("pane get", &output)),
+    };
 
     if actual.pane_id != expected.pane_id {
         return Err(recovery_rejected(
@@ -1255,19 +1645,32 @@ fn get_pane_with_visibility_retry(
     runner: &dyn ProcessRunner,
     herdr: &str,
     pane_id: &str,
-) -> Result<ProcessOutput, KernelError> {
+) -> Result<PaneLookup, KernelError> {
     for poll in 0..=AGENT_RECOVERY_POLLS {
-        let output = run(runner, herdr, &pane_get_argv(pane_id))?;
-        if output.exit_code == 0 {
-            return Ok(output);
+        match lookup_pane(runner, herdr, pane_id)? {
+            found @ PaneLookup::Found(_) => return Ok(found),
+            PaneLookup::Missing(_) if poll < AGENT_RECOVERY_POLLS => {
+                std::thread::sleep(AGENT_START_RETRY_DELAY);
+            }
+            missing @ PaneLookup::Missing(_) => return Ok(missing),
         }
-        if is_pane_not_found(&output) && poll < AGENT_RECOVERY_POLLS {
-            std::thread::sleep(AGENT_START_RETRY_DELAY);
-            continue;
-        }
-        return Err(launch_failed("pane get", &output));
     }
     unreachable!("bounded pane visibility loop always returns")
+}
+
+fn lookup_pane(
+    runner: &dyn ProcessRunner,
+    herdr: &str,
+    pane_id: &str,
+) -> Result<PaneLookup, KernelError> {
+    let output = run(runner, herdr, &pane_get_argv(pane_id))?;
+    if output.exit_code == 0 {
+        return parse_pane_get(&output.stdout).map(PaneLookup::Found);
+    }
+    if is_pane_not_found(&output) {
+        return Ok(PaneLookup::Missing(output));
+    }
+    Err(launch_failed("pane get", &output))
 }
 
 fn is_pane_not_found(output: &ProcessOutput) -> bool {

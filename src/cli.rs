@@ -818,7 +818,7 @@ fn run_send<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
             "--help" | "-h" => {
                 return command_help(
                     "send",
-                    "--mission-id <id> --role <source> --target <target> --kind <task|review> --body '<text>' [--database <path>] [--json]",
+                    "--mission-id <id> --role <source> --target <target> --kind <task|fix|context> --body '<text>' [--database <path>] [--json]",
                 );
             }
             other => {

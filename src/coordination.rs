@@ -172,6 +172,8 @@ pub fn read_role_context(
 
 /// Dispatch a coordination command through the kernel state machine.
 ///
+/// Parentless `review` commands are rejected before the database is opened;
+/// Reviewer assignments are created by the Worker reply transition instead.
 /// It builds a `HandleInput::Command` with freshly allocated ids and the target
 /// role's current generation, then persists via `MissionKernel::handle`. The
 /// resulting queued outbox rows are delivered later by `kernel_deliver`.
@@ -183,6 +185,19 @@ pub fn kernel_dispatch_command(
     kind: &str,
     text: &str,
 ) -> Result<KernelDispatchOutcome, KernelError> {
+    if kind == "review" {
+        return Err(KernelError {
+            category: ErrorCategory::Contract,
+            code: "review_parent_required".into(),
+            message: "Reviewer Assignments must be created from a completed Worker Assignment"
+                .into(),
+            retryable: false,
+            details: BTreeMap::from([
+                ("mission_id".into(), json!(mission_id)),
+                ("target".into(), json!(target)),
+            ]),
+        });
+    }
     let mut kernel = MissionKernel::open_writable_sqlite_v3(
         mission_id,
         database,

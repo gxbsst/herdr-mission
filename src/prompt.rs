@@ -112,6 +112,16 @@ mod tests {
         assert!(prompt.contains("/tmp/herdr-mission.sqlite3"));
         assert!(prompt.contains("/opt/herdr-mission"));
         assert!(prompt.contains("--role=pm"));
+        assert!(prompt
+            .lines()
+            .any(|line| { line.contains(" start-role ") && line.contains("--role=reviewer") }));
+        assert!(prompt.contains("deliver --json"));
+        assert!(!prompt
+            .lines()
+            .any(|line| line.contains(" init ") && line.contains("--role=reviewer")));
+        assert!(!prompt
+            .lines()
+            .any(|line| line.contains(" send ") && line.contains("--kind=review")));
         assert!(!prompt.contains("{{database}}"));
         assert!(!prompt.contains("{{bin}}"));
         assert!(!prompt.contains("{{role}}"));

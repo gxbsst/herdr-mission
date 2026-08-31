@@ -1,6 +1,6 @@
 id = "weston.herdr-mission"
 name = "Herdr Mission"
-version = "0.1.7"
+version = "0.1.8"
 description = "独立 Rust Team Mission runtime：创建、运行、恢复与管理团队 Mission，与 Herdr Kit 和 Python 完全解耦。"
 min_herdr_version = "0.8.0"
 platforms = ["macos", "linux"]

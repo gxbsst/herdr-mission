@@ -27,6 +27,94 @@ fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+fn create_cli_mission(path: &Path, title: &str) -> String {
+    let output = Command::new(kernel_binary())
+        .args(["new", "--json", "--no-start"])
+        .arg(format!("--title={title}"))
+        .arg(format!("--database={}", path.display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "new failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["mission_id"].as_str().unwrap().to_string()
+}
+
+fn mission_write_snapshot(
+    connection: &Connection,
+    mission_id: &str,
+) -> (i64, String, i64, i64, i64, i64, i64, i64) {
+    connection
+        .query_row(
+            "SELECT team_missions.context_rev, team_missions.updated_at,
+                    (SELECT COUNT(*) FROM assignments WHERE mission_id = ?1),
+                    (SELECT COUNT(*) FROM messages WHERE mission_id = ?1),
+                    (SELECT COUNT(*) FROM outbox WHERE mission_id = ?1),
+                    (SELECT COUNT(*) FROM context_ledger WHERE mission_id = ?1),
+                    (SELECT COUNT(*) FROM review_revisions WHERE mission_id = ?1),
+                    (SELECT COUNT(*) FROM processed_events WHERE mission_id = ?1)
+             FROM team_missions WHERE mission_id = ?1",
+            [mission_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn direct_review_is_rejected_before_any_mission_write() {
+    let path = temp_db_path("direct-review-parent");
+    let mission_id = create_cli_mission(&path, "Review parent required");
+    let connection = Connection::open(&path).unwrap();
+    let before = mission_write_snapshot(&connection, &mission_id);
+    drop(connection);
+
+    let direct_review = Command::new(kernel_binary())
+        .args([
+            "send",
+            "--json",
+            "--role=pm",
+            "--target=reviewer",
+            "--kind=review",
+            "--body=review this directly",
+        ])
+        .arg(format!("--mission-id={mission_id}"))
+        .arg(format!("--database={}", path.display()))
+        .output()
+        .unwrap();
+    assert!(!direct_review.status.success());
+    let direct_review: Value = serde_json::from_slice(&direct_review.stdout).unwrap();
+    assert_eq!(direct_review["error"]["category"], "contract");
+    assert_eq!(direct_review["error"]["code"], "review_parent_required");
+    assert_eq!(direct_review["error"]["retryable"], false);
+
+    let send_help = Command::new(kernel_binary())
+        .args(["send", "--help"])
+        .output()
+        .unwrap();
+    assert!(send_help.status.success());
+    let send_help = String::from_utf8(send_help.stdout).unwrap();
+    assert!(send_help.contains("--kind <task|fix|context>"));
+    assert!(!send_help.contains("review"));
+
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(mission_write_snapshot(&connection, &mission_id), before);
+    cleanup(&path);
+}
+
 #[test]
 fn doctor_bootstraps_and_reports_json() {
     let path = temp_db_path("doctor");

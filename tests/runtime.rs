@@ -2,7 +2,11 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{Receiver, SyncSender},
+    },
+    time::Duration,
 };
 
 use herdr_mission::{
@@ -11,7 +15,7 @@ use herdr_mission::{
     MissionLayout, MissionWorkspace, ProcessOutput, ProcessRunner, Provider, TabMode,
     WorkspaceSource,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -27,6 +31,81 @@ fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PersistedRuntimeState {
+    role: (String, String, Option<String>, String, String, i64, String),
+    lease: Option<(String, String, i64, i64)>,
+    workspace: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ),
+}
+
+fn persisted_runtime_state(path: &Path, mission_id: &str, role: &str) -> PersistedRuntimeState {
+    let connection = Connection::open(path).unwrap();
+    let role_state = connection
+        .query_row(
+            "SELECT pane_id, terminal_id, session_json, launch_generation,
+                    health, last_seen_rev, updated_at
+             FROM team_roles WHERE mission_id = ?1 AND role = ?2",
+            rusqlite::params![mission_id, role],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    let lease = connection
+        .query_row(
+            "SELECT owner, generation, acquired_at, expires_at
+             FROM role_launch_leases WHERE mission_id = ?1 AND role = ?2",
+            rusqlite::params![mission_id, role],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .unwrap();
+    let workspace = connection
+        .query_row(
+            "SELECT source, workspace_id, tab_id, root_pane_id, execution_tab_id,
+                    review_tab_id, verification_tab_id, worktree_path, branch
+             FROM mission_workspace WHERE mission_id = ?1",
+            [mission_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .unwrap();
+    PersistedRuntimeState {
+        role: role_state,
+        lease,
+        workspace,
+    }
+}
+
 struct FakeRunner {
     calls: RefCell<Vec<(String, Vec<String>)>>,
     agent_start_error: Option<&'static str>,
@@ -40,7 +119,12 @@ struct FakeRunner {
     remaining_agent_start_failures: Cell<Option<u32>>,
     agent_start_failure_pane: Option<&'static str>,
     pane_not_found_pane: Option<&'static str>,
+    pane_lookup_error_code: &'static str,
     remaining_pane_not_found: Cell<u32>,
+    fail_pane_split: bool,
+    malformed_pane_split_success: bool,
+    split_entered: Option<SyncSender<()>>,
+    split_release: Option<Receiver<()>>,
     missing_tab: Option<&'static str>,
     missing_workspace: Option<&'static str>,
 }
@@ -76,7 +160,12 @@ impl FakeRunner {
             remaining_agent_start_failures: Cell::new(None),
             agent_start_failure_pane: None,
             pane_not_found_pane: None,
+            pane_lookup_error_code: "pane_not_found",
             remaining_pane_not_found: Cell::new(0),
+            fail_pane_split: false,
+            malformed_pane_split_success: false,
+            split_entered: None,
+            split_release: None,
             missing_tab: None,
             missing_workspace: None,
         }
@@ -117,6 +206,34 @@ impl FakeRunner {
     fn with_transient_pane_not_found(mut self, pane_id: &'static str, polls: u32) -> Self {
         self.pane_not_found_pane = Some(pane_id);
         self.remaining_pane_not_found.set(polls);
+        self
+    }
+
+    fn with_pane_lookup_error(
+        mut self,
+        pane_id: &'static str,
+        code: &'static str,
+        polls: u32,
+    ) -> Self {
+        self.pane_not_found_pane = Some(pane_id);
+        self.pane_lookup_error_code = code;
+        self.remaining_pane_not_found.set(polls);
+        self
+    }
+
+    fn with_pane_split_failure(mut self) -> Self {
+        self.fail_pane_split = true;
+        self
+    }
+
+    fn with_malformed_pane_split_success(mut self) -> Self {
+        self.malformed_pane_split_success = true;
+        self
+    }
+
+    fn with_blocking_split(mut self, entered: SyncSender<()>, release: Receiver<()>) -> Self {
+        self.split_entered = Some(entered);
+        self.split_release = Some(release);
         self
     }
 
@@ -302,6 +419,27 @@ impl ProcessRunner for FakeRunner {
                 })
             }
             Some("pane") if args.get(1).map(String::as_str) == Some("split") => {
+                if self.fail_pane_split {
+                    return Ok(ProcessOutput {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: r#"{"error":{"code":"split_failed","message":"split failed"}}"#
+                            .into(),
+                        });
+                }
+                if let Some(entered) = &self.split_entered {
+                    entered.send(()).unwrap();
+                }
+                if let Some(release) = &self.split_release {
+                    release.recv_timeout(Duration::from_secs(15)).unwrap();
+                }
+                if self.malformed_pane_split_success {
+                    return Ok(ProcessOutput {
+                        exit_code: 0,
+                        stdout: r#"{"result":{"pane":{}}}"#.into(),
+                        stderr: String::new(),
+                    });
+                }
                 Ok(ProcessOutput {
                     exit_code: 0,
                     stdout: r#"{"result":{"pane":{"pane_id":"w6J:pX"}}}"#.into(),
@@ -337,7 +475,8 @@ impl ProcessRunner for FakeRunner {
                         exit_code: 1,
                         stdout: String::new(),
                         stderr: format!(
-                            r#"{{"error":{{"code":"pane_not_found","message":"pane {pane_id} not found"}}}}"#
+                            r#"{{"error":{{"code":"{}","message":"pane_not_found: pane {pane_id} not found"}}}}"#,
+                            self.pane_lookup_error_code,
                         ),
                     });
                 }
@@ -1012,6 +1151,1066 @@ fn resume_waits_for_a_persisted_pane_but_starts_it_only_once() {
     assert_eq!(outcome.stage, "active");
     assert_eq!(runner.count_calls("pane", "split"), 0);
     assert_eq!(runner.count_calls("agent", "start"), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn resume_replaces_a_confirmed_missing_completed_pane_and_reuses_the_new_binding() {
+    let path = temp_db("completed-pane-replacement");
+    let mission_id = "msn-20260831-100000-completed-pane-replacement-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let old_generation = "launch.worker/opaque:deleted-pane";
+    let expected_agent_name = format!("mission-{}-worker", agent_name_token(mission_id));
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles
+             SET pane_id = 'w6J:p-deleted',
+                 terminal_id = ?1,
+                 session_json = '{\"kind\":\"session\",\"value\":\"old\"}',
+                 launch_generation = ?2,
+                 health = 'ready',
+                 last_seen_rev = 41
+             WHERE mission_id = ?3 AND role = 'worker'",
+            rusqlite::params![expected_agent_name, old_generation, mission_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO role_launch_leases(
+                 mission_id, role, owner, generation, acquired_at, expires_at
+             ) VALUES(?1, 'worker', 'old-owner', ?2, 0, 1)",
+            rusqlite::params![mission_id, old_generation],
+        )
+        .unwrap();
+    drop(connection);
+
+    let runner = FakeRunner::success().with_transient_pane_not_found("w6J:p-deleted", 21);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let recovered = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(recovered.roles.len(), 1);
+    assert_eq!(recovered.roles[0].pane_id, "w6J:pX");
+
+    let binding: (String, String, Option<String>, String, String, i64, i64) =
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT pane_id, terminal_id, session_json, launch_generation,
+                        health, last_seen_rev,
+                        (SELECT COUNT(*) FROM role_launch_leases
+                         WHERE mission_id = ?1 AND role = 'worker')
+                 FROM team_roles WHERE mission_id = ?1 AND role = 'worker'",
+                [mission_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+    assert_eq!(binding.0, "w6J:pX");
+    assert_eq!(binding.1, expected_agent_name);
+    assert_eq!(binding.2, None);
+    assert_ne!(binding.3, old_generation);
+    assert!(!binding.3.is_empty());
+    assert!(
+        binding
+            .3
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.'))
+    );
+    assert_eq!(binding.4, "idle");
+    assert_eq!(binding.5, 0);
+    assert_eq!(binding.6, 0);
+
+    let resumed = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(resumed.roles.is_empty());
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(runner.count_calls("agent", "start"), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn resume_replaces_a_confirmed_missing_staged_pane() {
+    let path = temp_db("staged-pane-replacement");
+    let mission_id = "msn-20260831-100100-staged-pane-replacement-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE team_roles
+             SET pane_id = 'w6J:p-staged-deleted', terminal_id = '',
+                 session_json = NULL, launch_generation = 'generation-staged-old',
+                 health = 'unknown', last_seen_rev = 0
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+
+    let runner = FakeRunner::success().with_transient_pane_not_found("w6J:p-staged-deleted", 21);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+    let recovered = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(recovered.roles.len(), 1);
+    assert_eq!(recovered.roles[0].pane_id, "w6J:pX");
+    let binding: (String, String, String) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT pane_id, terminal_id, launch_generation
+             FROM team_roles WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(binding.0, "w6J:pX");
+    assert_eq!(binding.1, recovered.roles[0].agent_name);
+    assert_ne!(binding.2, "generation-staged-old");
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(runner.count_calls("agent", "start"), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn manual_resume_replaces_a_confirmed_missing_staged_role() {
+    let path = temp_db("manual-staged-pane-replacement");
+    let mission_id = "msn-20260831-100150-manual-staged-pane-replacement-0b801f50";
+    create_mission(&path, &manual_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE team_roles
+             SET pane_id = 'w6J:p-scout-staged-deleted', terminal_id = '',
+                 session_json = NULL, launch_generation = 'generation-scout-staged-old',
+                 health = 'unknown', last_seen_rev = 0
+             WHERE mission_id = ?1 AND role = 'scout'",
+            [mission_id],
+        )
+        .unwrap();
+
+    let runner =
+        FakeRunner::success().with_transient_pane_not_found("w6J:p-scout-staged-deleted", 21);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+    let recovered = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(recovered.roles.len(), 1);
+    assert_eq!(recovered.roles[0].role, "scout");
+    assert_eq!(recovered.roles[0].pane_id, "w6J:pX");
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(runner.count_calls("agent", "start"), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn start_role_replaces_a_confirmed_missing_completed_pane() {
+    let path = temp_db("start-role-completed-pane-replacement");
+    let mission_id = "msn-20260831-100200-start-role-pane-replacement-0b801f50";
+    create_mission(&path, &manual_mission_request(mission_id)).unwrap();
+    let initial = FakeRunner::success();
+    let launch = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &initial,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let expected_agent_name = format!("mission-{}-scout", agent_name_token(mission_id));
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE team_roles
+             SET pane_id = 'w6J:p-scout-deleted', terminal_id = ?1,
+                 session_json = '{\"kind\":\"session\",\"value\":\"old\"}',
+                 launch_generation = 'generation-scout-old', health = 'ready',
+                 last_seen_rev = 9
+             WHERE mission_id = ?2 AND role = 'scout'",
+            rusqlite::params![expected_agent_name, mission_id],
+        )
+        .unwrap();
+
+    let runner = FakeRunner::success().with_transient_pane_not_found("w6J:p-scout-deleted", 21);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+    let recovered = start_role(
+        &path,
+        mission_id,
+        "scout",
+        &launch.roles[0].pane_id,
+        ".",
+        None,
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(recovered.pane_id, "w6J:pX");
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(runner.count_calls("agent", "start"), 1);
+    let again = start_role(
+        &path,
+        mission_id,
+        "scout",
+        &launch.roles[0].pane_id,
+        ".",
+        None,
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(again, None);
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(runner.count_calls("agent", "start"), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn completed_pane_identity_mismatch_fails_without_replacement_or_binding_writes() {
+    let path = temp_db("completed-pane-mismatch");
+    let mission_id = "msn-20260831-100300-completed-pane-mismatch-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let before = persisted_runtime_state(&path, mission_id, "worker");
+    let runner = FakeRunner::new(
+        None,
+        Some(FakePaneState {
+            agent: "codex",
+            cwd: "/repo/foreign",
+            tab_label: "工作区",
+            has_session: true,
+        }),
+        false,
+    );
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let error = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "launch_effect_failed");
+    assert!(!error.retryable);
+    assert_eq!(runner.count_calls("pane", "split"), 0);
+    assert_eq!(runner.count_calls("agent", "start"), 0);
+    assert_eq!(persisted_runtime_state(&path, mission_id, "worker"), before);
+    cleanup(&path);
+}
+
+#[test]
+fn pane_not_found_text_under_another_error_code_never_triggers_replacement() {
+    let path = temp_db("pane-not-found-message-only");
+    let mission_id = "msn-20260831-100400-pane-not-found-message-only-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let before = persisted_runtime_state(&path, mission_id, "worker");
+    let runner = FakeRunner::success().with_pane_lookup_error("w6J:p0", "transport_failed", 1);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let error = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "launch_effect_failed");
+    assert_eq!(runner.count_calls("pane", "split"), 0);
+    assert_eq!(persisted_runtime_state(&path, mission_id, "worker"), before);
+    cleanup(&path);
+}
+
+#[test]
+fn live_role_launch_lease_blocks_missing_pane_replacement_before_split() {
+    let path = temp_db("missing-pane-live-lease");
+    let mission_id = "msn-20260831-100500-missing-pane-live-lease-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles SET pane_id = 'w6J:p-deleted',
+                 launch_generation = 'generation-live-owner'
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO role_launch_leases(
+                 mission_id, role, owner, generation, acquired_at, expires_at
+             ) VALUES(?1, 'worker', 'other-launcher', 'generation-live-owner',
+                      1, 4102444800)",
+            [mission_id],
+        )
+        .unwrap();
+    drop(connection);
+    let before = persisted_runtime_state(&path, mission_id, "worker");
+    let runner = FakeRunner::success().with_transient_pane_not_found("w6J:p-deleted", 21);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let error = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "role_runtime_replacement_busy");
+    assert!(error.retryable);
+    assert_eq!(runner.count_calls("pane", "split"), 0);
+    assert_eq!(persisted_runtime_state(&path, mission_id, "worker"), before);
+    cleanup(&path);
+}
+
+#[test]
+fn expired_lease_cannot_start_a_second_split_while_the_first_split_is_in_flight() {
+    let path = temp_db("missing-pane-expired-lease-concurrency");
+    let mission_id = "msn-20260831-100550-missing-pane-expired-concurrency-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles SET pane_id = 'w6J:p-deleted',
+                 launch_generation = 'generation-expired-concurrent'
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO role_launch_leases(
+                 mission_id, role, owner, generation, acquired_at, expires_at
+             ) VALUES(?1, 'worker', 'expired-launcher',
+                      'generation-expired-concurrent', 0, 1)",
+            [mission_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let empty_pane = FakePaneState {
+        agent: "",
+        cwd: ".",
+        tab_label: "工作区",
+        has_session: false,
+    };
+    let (split_entered_tx, split_entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (split_release_tx, split_release_rx) = std::sync::mpsc::sync_channel(1);
+    let first_runner = FakeRunner::new(None, Some(empty_pane), false)
+        .with_transient_pane_not_found("w6J:p-deleted", 21)
+        .with_blocking_split(split_entered_tx, split_release_rx);
+    first_runner.set_tab_label("w6J:t2", "审查");
+    first_runner.set_tab_label("w6J:t3", "验证");
+    let first_path = path.clone();
+    let first = std::thread::spawn(move || {
+        let result = launch_mission(
+            &first_path,
+            mission_id,
+            &LaunchOptions::default(),
+            &first_runner,
+            "herdr",
+            &mut |_| {},
+        );
+        (result, first_runner)
+    });
+    split_entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+
+    let second_runner = FakeRunner::new(None, Some(empty_pane), false)
+        .with_transient_pane_not_found("w6J:p-deleted", 21);
+    second_runner.set_tab_label("w6J:t2", "审查");
+    second_runner.set_tab_label("w6J:t3", "验证");
+    let second_path = path.clone();
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::sync_channel(1);
+    let second = std::thread::spawn(move || {
+        second_started_tx.send(()).unwrap();
+        let result = launch_mission(
+            &second_path,
+            mission_id,
+            &LaunchOptions::default(),
+            &second_runner,
+            "herdr",
+            &mut |_| {},
+        );
+        (result, second_runner)
+    });
+    second_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    split_release_tx.send(()).unwrap();
+
+    let (first_result, first_runner) = first.join().unwrap();
+    let (second_result, second_runner) = second.join().unwrap();
+    assert!(first_result.is_ok());
+    let second_error = second_result.unwrap_err();
+    assert_eq!(second_error.code, "role_runtime_replacement_conflict");
+    assert_eq!(first_runner.count_calls("pane", "split"), 1);
+    assert_eq!(second_runner.count_calls("pane", "split"), 0);
+    let state = persisted_runtime_state(&path, mission_id, "worker");
+    assert_eq!(state.role.0, "w6J:pX");
+    assert_eq!(state.role.4, "idle");
+    assert_eq!(state.lease, None);
+    cleanup(&path);
+}
+
+#[test]
+fn replacement_split_failure_restores_the_exact_old_binding_and_lease() {
+    let path = temp_db("missing-pane-split-failure");
+    let mission_id = "msn-20260831-100600-missing-pane-split-failure-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles SET pane_id = 'w6J:p-deleted',
+                 launch_generation = 'generation-expired-owner'
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO role_launch_leases(
+                 mission_id, role, owner, generation, acquired_at, expires_at
+             ) VALUES(?1, 'worker', 'expired-launcher', 'generation-expired-owner', 0, 1)",
+            [mission_id],
+        )
+        .unwrap();
+    drop(connection);
+    let before = persisted_runtime_state(&path, mission_id, "worker");
+    let runner = FakeRunner::success()
+        .with_transient_pane_not_found("w6J:p-deleted", 21)
+        .with_pane_split_failure();
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let error = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "launch_effect_failed");
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(runner.count_calls("agent", "start"), 0);
+    assert_eq!(persisted_runtime_state(&path, mission_id, "worker"), before);
+    cleanup(&path);
+}
+
+#[test]
+fn replacement_agent_start_failure_keeps_one_staged_pane_for_retry() {
+    let path = temp_db("missing-pane-agent-start-retry");
+    let mission_id = "msn-20260831-100650-missing-pane-agent-start-retry-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE team_roles SET pane_id = 'w6J:p-deleted',
+                 launch_generation = 'generation-before-retry'
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+    let runner = FakeRunner::recoverable_agent_start(
+        "agent start failed",
+        FakePaneState {
+            agent: "",
+            cwd: ".",
+            tab_label: "工作区",
+            has_session: false,
+        },
+    )
+    .with_transient_pane_not_found("w6J:p-deleted", 42);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let first = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(first.code, "launch_effect_failed");
+    let staged = persisted_runtime_state(&path, mission_id, "worker");
+    assert_eq!(staged.role.0, "w6J:pX");
+    assert_eq!(staged.role.1, "");
+    assert_eq!(staged.role.4, "starting");
+    assert_eq!(staged.lease, None);
+
+    let second = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(second.code, "launch_effect_failed");
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(persisted_runtime_state(&path, mission_id, "worker"), staged);
+    cleanup(&path);
+}
+
+#[test]
+fn replacement_stage_cas_failure_fences_without_closing_the_returned_pane() {
+    let path = temp_db("missing-pane-finalize-cas");
+    let mission_id = "msn-20260831-100700-missing-pane-finalize-cas-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles SET pane_id = 'w6J:p-deleted',
+                 launch_generation = 'generation-before-cas'
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER ignore_role_runtime_replacement
+             BEFORE UPDATE OF pane_id ON team_roles
+             WHEN OLD.role = 'worker' AND NEW.pane_id = 'w6J:pX'
+             BEGIN
+                 SELECT RAISE(IGNORE);
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+    let before = persisted_runtime_state(&path, mission_id, "worker");
+    let runner = FakeRunner::new(
+        None,
+        Some(FakePaneState {
+            agent: "",
+            cwd: ".",
+            tab_label: "工作区",
+            has_session: false,
+        }),
+        false,
+    )
+    .with_transient_pane_not_found("w6J:p-deleted", 42);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let error = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "role_runtime_replacement_conflict");
+    assert!(error.retryable);
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(runner.count_calls("agent", "start"), 0);
+    let fenced = persisted_runtime_state(&path, mission_id, "worker");
+    assert_eq!(fenced.role, before.role);
+    assert_eq!(fenced.workspace, before.workspace);
+    assert_eq!(fenced.lease.as_ref().unwrap().3, i64::MAX);
+
+    let second = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(second.code, "role_runtime_replacement_busy");
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(persisted_runtime_state(&path, mission_id, "worker"), fenced);
+    cleanup(&path);
+}
+
+#[test]
+fn replacement_stage_update_error_is_fenced_before_transaction_release() {
+    let path = temp_db("missing-pane-stage-update-error");
+    let mission_id = "msn-20260831-100705-missing-pane-update-error-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles SET pane_id = 'w6J:p-deleted',
+                 launch_generation = 'generation-before-update-error'
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER abort_role_runtime_replacement
+             BEFORE UPDATE OF pane_id ON team_roles
+             WHEN OLD.role = 'worker' AND NEW.pane_id = 'w6J:pX'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced replacement update failure');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+    let before = persisted_runtime_state(&path, mission_id, "worker");
+    let runner = FakeRunner::success().with_transient_pane_not_found("w6J:p-deleted", 42);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let first = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(first.code, "sqlite_role_update_failed");
+    let fenced = persisted_runtime_state(&path, mission_id, "worker");
+    assert_eq!(fenced.role, before.role);
+    assert_eq!(fenced.workspace, before.workspace);
+    assert_eq!(fenced.lease.as_ref().unwrap().3, i64::MAX);
+
+    let second = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(second.code, "role_runtime_replacement_busy");
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(persisted_runtime_state(&path, mission_id, "worker"), fenced);
+    cleanup(&path);
+}
+
+#[test]
+fn replacement_stage_cas_failure_with_a_foreign_pane_fences_retry() {
+    let path = temp_db("missing-pane-stage-cas-foreign");
+    let mission_id = "msn-20260831-100710-missing-pane-cas-foreign-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles SET pane_id = 'w6J:p-deleted',
+                 launch_generation = 'generation-before-foreign-cas'
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER ignore_foreign_role_runtime_replacement
+             BEFORE UPDATE OF pane_id ON team_roles
+             WHEN OLD.role = 'worker' AND NEW.pane_id = 'w6J:pX'
+             BEGIN
+                 SELECT RAISE(IGNORE);
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+    let before = persisted_runtime_state(&path, mission_id, "worker");
+    let runner = FakeRunner::success().with_transient_pane_not_found("w6J:p-deleted", 42);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let first = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(first.code, "role_runtime_replacement_conflict");
+    let fenced = persisted_runtime_state(&path, mission_id, "worker");
+    assert_eq!(fenced.role, before.role);
+    assert_eq!(fenced.workspace, before.workspace);
+    assert_eq!(fenced.lease.as_ref().unwrap().3, i64::MAX);
+
+    let second = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(second.code, "role_runtime_replacement_busy");
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(persisted_runtime_state(&path, mission_id, "worker"), fenced);
+    cleanup(&path);
+}
+
+#[test]
+fn malformed_successful_split_is_fenced_and_never_repeated() {
+    let path = temp_db("missing-pane-malformed-split-success");
+    let mission_id = "msn-20260831-100720-malformed-split-success-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles SET pane_id = 'w6J:p-deleted',
+                 launch_generation = 'generation-before-malformed-split'
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+    drop(connection);
+    let before = persisted_runtime_state(&path, mission_id, "worker");
+    let runner = FakeRunner::success()
+        .with_malformed_pane_split_success()
+        .with_transient_pane_not_found("w6J:p-deleted", 42);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let first = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(first.code, "herdr_response_missing_field");
+    let fenced = persisted_runtime_state(&path, mission_id, "worker");
+    assert_eq!(fenced.role, before.role);
+    assert_eq!(fenced.workspace, before.workspace);
+    assert_eq!(fenced.lease.as_ref().unwrap().3, i64::MAX);
+
+    let second = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(second.code, "role_runtime_replacement_busy");
+    assert_eq!(runner.count_calls("pane", "split"), 1);
+    assert_eq!(persisted_runtime_state(&path, mission_id, "worker"), fenced);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_recovery_cannot_split_before_a_malformed_success_is_fenced() {
+    let path = temp_db("missing-pane-malformed-split-concurrency");
+    let mission_id = "msn-20260831-100730-malformed-split-concurrency-0b801f50";
+    create_mission(&path, &simple_mission_request(mission_id)).unwrap();
+    launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &FakeRunner::success(),
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE team_roles SET pane_id = 'w6J:p-deleted',
+                 launch_generation = 'generation-before-malformed-concurrency'
+             WHERE mission_id = ?1 AND role = 'worker'",
+            [mission_id],
+        )
+        .unwrap();
+
+    let (split_entered_tx, split_entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (split_release_tx, split_release_rx) = std::sync::mpsc::sync_channel(1);
+    let first_runner = FakeRunner::success()
+        .with_malformed_pane_split_success()
+        .with_transient_pane_not_found("w6J:p-deleted", 21)
+        .with_blocking_split(split_entered_tx, split_release_rx);
+    first_runner.set_tab_label("w6J:t2", "审查");
+    first_runner.set_tab_label("w6J:t3", "验证");
+    let first_path = path.clone();
+    let first = std::thread::spawn(move || {
+        let result = launch_mission(
+            &first_path,
+            mission_id,
+            &LaunchOptions::default(),
+            &first_runner,
+            "herdr",
+            &mut |_| {},
+        );
+        (result, first_runner)
+    });
+    split_entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+
+    let second_runner = FakeRunner::success().with_transient_pane_not_found("w6J:p-deleted", 21);
+    second_runner.set_tab_label("w6J:t2", "审查");
+    second_runner.set_tab_label("w6J:t3", "验证");
+    let second_path = path.clone();
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::sync_channel(1);
+    let second = std::thread::spawn(move || {
+        second_started_tx.send(()).unwrap();
+        let result = launch_mission(
+            &second_path,
+            mission_id,
+            &LaunchOptions::default(),
+            &second_runner,
+            "herdr",
+            &mut |_| {},
+        );
+        (result, second_runner)
+    });
+    second_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    split_release_tx.send(()).unwrap();
+
+    let (first_result, first_runner) = first.join().unwrap();
+    let (second_result, second_runner) = second.join().unwrap();
+    assert_eq!(
+        first_result.unwrap_err().code,
+        "herdr_response_missing_field"
+    );
+    assert!(matches!(
+        second_result.unwrap_err().code.as_str(),
+        "role_runtime_replacement_busy" | "role_runtime_replacement_conflict"
+    ));
+    assert_eq!(first_runner.count_calls("pane", "split"), 1);
+    assert_eq!(second_runner.count_calls("pane", "split"), 0);
+    let fenced = persisted_runtime_state(&path, mission_id, "worker");
+    assert_eq!(fenced.role.0, "w6J:p-deleted");
+    assert_eq!(fenced.lease.as_ref().unwrap().3, i64::MAX);
+    cleanup(&path);
+}
+
+#[test]
+fn start_role_reuses_a_live_completed_role_without_consulting_a_missing_anchor() {
+    let path = temp_db("start-role-reuse-with-missing-anchor");
+    let mission_id = "msn-20260831-100800-start-role-reuse-anchor-0b801f50";
+    create_mission(&path, &manual_mission_request(mission_id)).unwrap();
+    let initial = FakeRunner::success();
+    let launch = launch_mission(
+        &path,
+        mission_id,
+        &LaunchOptions::default(),
+        &initial,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    start_role(
+        &path,
+        mission_id,
+        "scout",
+        &launch.roles[0].pane_id,
+        ".",
+        None,
+        &initial,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap()
+    .unwrap();
+    let runner = FakeRunner::success().with_transient_pane_not_found("w6J:p0", 21);
+    runner.set_tab_label("w6J:t2", "审查");
+    runner.set_tab_label("w6J:t3", "验证");
+
+    let reused = start_role(
+        &path,
+        mission_id,
+        "scout",
+        "w6J:p0",
+        ".",
+        None,
+        &runner,
+        "herdr",
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(reused, None);
+    assert_eq!(runner.count_calls("pane", "split"), 0);
+    assert_eq!(runner.count_calls("agent", "start"), 0);
     cleanup(&path);
 }
 
