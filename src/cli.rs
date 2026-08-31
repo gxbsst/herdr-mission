@@ -12,6 +12,7 @@ use std::{
 
 use serde_json::json;
 
+use crate::keybinding::{default_herdr_config_path, install_herdr_keybinding};
 use crate::{
     agent_name_token, agent_rename_argv, bootstrap_database, compute_manifest, create_mission,
     delete_mission, herdr_bin, is_valid_role_identity, kernel_deliver, kernel_dispatch_command,
@@ -39,6 +40,7 @@ pub fn run(args: &[String]) -> i32 {
     match command {
         Some("help") | Some("--help") | Some("-h") => print_usage(),
         Some("doctor") => run_doctor(iter),
+        Some("install-keybinding") => run_install_keybinding(iter),
         Some("new") => run_new(iter),
         Some("status") => run_status(iter),
         Some("set-launch-mode") => run_set_launch_mode(iter),
@@ -64,6 +66,144 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
+fn run_install_keybinding<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
+    let mut config_path = None;
+    let mut no_reload = false;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => {
+                let Some(value) = args.next().filter(|value| !value.starts_with('-')) else {
+                    return keybinding_cli_fail(
+                        ErrorCategory::Transport,
+                        "malformed_args",
+                        "--config requires a path",
+                        false,
+                        EXIT_MALFORMED_ARGS,
+                    );
+                };
+                config_path = Some(PathBuf::from(value));
+            }
+            "--no-reload" => no_reload = true,
+            "--help" | "-h" => {
+                return command_help("install-keybinding", "--config <path> [--no-reload]");
+            }
+            other => {
+                return keybinding_cli_fail(
+                    ErrorCategory::Transport,
+                    "malformed_args",
+                    format!("unexpected argument: {other}"),
+                    false,
+                    EXIT_MALFORMED_ARGS,
+                );
+            }
+        }
+    }
+    let Some(config_path) = config_path.or_else(default_herdr_config_path) else {
+        return keybinding_cli_fail(
+            ErrorCategory::Transport,
+            "config_path_unavailable",
+            "cannot resolve Herdr config path",
+            false,
+            EXIT_MALFORMED_ARGS,
+        );
+    };
+
+    if let Err(error) = install_herdr_keybinding(&config_path) {
+        let (category, code, retryable) = match error.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                (ErrorCategory::Contract, "keybinding_conflict", false)
+            }
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+                (ErrorCategory::Contract, "invalid_herdr_config", false)
+            }
+            std::io::ErrorKind::WouldBlock => {
+                (ErrorCategory::Operation, "herdr_config_changed", true)
+            }
+            _ => (
+                ErrorCategory::Infrastructure,
+                "keybinding_install_failed",
+                false,
+            ),
+        };
+        return keybinding_cli_fail(
+            category,
+            code,
+            format!("failed to install Herdr Mission keybinding: {error}"),
+            retryable,
+            1,
+        );
+    }
+    if !no_reload {
+        reload_herdr_config();
+    }
+    let prefix = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|content| content.parse::<toml::Value>().ok())
+        .and_then(|config| {
+            config
+                .get("keys")
+                .and_then(|keys| keys.get("prefix"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "ctrl+b".to_string());
+    println!(
+        "{}",
+        json!({
+            "status": "installed",
+            "config_path": config_path,
+            "key": "prefix+m",
+            "prefix": prefix,
+        })
+    );
+    0
+}
+
+fn keybinding_cli_fail(
+    category: ErrorCategory,
+    code: &str,
+    message: impl Into<String>,
+    retryable: bool,
+    exit_code: i32,
+) -> i32 {
+    let message = message.into();
+    eprintln!("failed: {message}");
+    println!(
+        "{}",
+        json!({
+            "status": "error",
+            "error": KernelError {
+                category,
+                code: code.to_string(),
+                message,
+                retryable,
+                details: BTreeMap::new(),
+            },
+        })
+    );
+    exit_code
+}
+
+fn reload_herdr_config() {
+    let herdr = std::env::var_os("HERDR_BIN_PATH")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "herdr".into());
+    let result = std::process::Command::new(herdr)
+        .args(["server", "reload-config"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(_) => eprintln!("Herdr config updated; it will apply when the server next starts"),
+        Err(error) => eprintln!(
+            "Herdr config updated; reload was unavailable ({error}); it will apply when the server next starts"
+        ),
+    }
+}
+
 fn print_usage() -> i32 {
     println!(
         "usage: herdr-mission <command> [options]\n\
@@ -86,6 +226,7 @@ fn print_usage() -> i32 {
            delete      删除 Mission\n\
            tui         打开控制台\n\
            doctor      自检\n\
+           install-keybinding  安装 Mission 看板快捷键\n\
            daemon      常驻投递 daemon\n\
            stop        停止 daemon\n\
            manifest    校验二进制\n\

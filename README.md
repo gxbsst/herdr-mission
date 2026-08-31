@@ -12,7 +12,21 @@ herdr plugin install gxbsst/herdr-mission --yes
 ```
 
 安装时 herdr 会 clone 本仓库，执行 `fetch-or-build.sh`：优先从 GitHub Releases 下载
-匹配版本+平台的预编译二进制并校验 SHA-256，下载失败才回退到源码编译。
+匹配版本+平台的预编译二进制并校验 SHA-256，下载失败才回退到源码编译。随后安装器会
+自动写入 Mission 看板快捷键：
+
+- 尚无 Herdr `config.toml` 时创建 `prefix = "ctrl+a"`，按 `ctrl+a` 后再按 `m` 打开看板。
+- 已有显式 prefix 时保持不变，仍使用该 prefix 后再按 `m`。
+- 已有配置但未显式声明 prefix 时保持 Herdr 默认 `ctrl+b`，不会改动其他快捷键的 prefix。
+- `prefix+m` 已被其他命令占用时安装失败，原配置保持不变。
+
+这是 Herdr 0.8.2 的插件生命周期限制下采用的安装期配置：plugin manifest 不能原生声明
+快捷键，GitHub `plugin install` 会运行 build hook，而本地 `plugin link` 不会。`plugin
+unlink` 也没有卸载 hook，因此卸载后如需移除快捷键，应手动删除对应的
+`[[keys.command]]`。官方能力核对见
+[`docs/keybinding-install-research.md`](docs/keybinding-install-research.md)。
+安装期间请避免同时在另一个进程保存 Herdr 设置；Herdr 0.8.2 尚未提供配置写入 API
+或跨进程配置锁。
 
 ## 前置依赖
 
