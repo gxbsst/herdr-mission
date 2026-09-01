@@ -8,6 +8,7 @@ mod creation;
 mod daemon;
 mod effects;
 mod herdr;
+mod installer;
 mod keybinding;
 mod log;
 mod manifest;

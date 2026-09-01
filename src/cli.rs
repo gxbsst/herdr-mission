@@ -13,6 +13,7 @@ use std::{
 
 use serde_json::json;
 
+use crate::installer::publish_fresh_skill_copy;
 use crate::keybinding::{default_herdr_config_path, install_herdr_keybinding};
 use crate::{
     acknowledge_peer_message, agent_list_argv, agent_name_token, agent_rename_argv,
@@ -45,6 +46,7 @@ pub fn run(args: &[String]) -> i32 {
         Some("help") | Some("--help") | Some("-h") => print_usage(),
         Some("doctor") => run_doctor(iter),
         Some("install-keybinding") => run_install_keybinding(iter),
+        Some("__install-skill-copy") => run_install_skill_copy(iter),
         Some("new") => run_new(iter),
         Some("status") => run_status(iter),
         Some("set-launch-mode") => run_set_launch_mode(iter),
@@ -69,6 +71,40 @@ pub fn run(args: &[String]) -> i32 {
         }
         None => print_usage(),
     }
+}
+
+fn run_install_skill_copy<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
+    let mut payload = None;
+    let mut target = None;
+    let mut target_kind = None;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        let destination = match arg.as_str() {
+            "--payload" => &mut payload,
+            "--target" => &mut target,
+            "--kind" => &mut target_kind,
+            other => {
+                eprintln!("unexpected installer argument: {other}");
+                return EXIT_MALFORMED_ARGS;
+            }
+        };
+        let Some(value) = args.next().filter(|value| !value.is_empty()) else {
+            eprintln!("{arg} requires a value");
+            return EXIT_MALFORMED_ARGS;
+        };
+        *destination = Some(value.as_str());
+    }
+
+    let (Some(payload), Some(target), Some(target_kind)) = (payload, target, target_kind) else {
+        eprintln!("--payload, --target and --kind are required");
+        return EXIT_MALFORMED_ARGS;
+    };
+    if let Err(error) = publish_fresh_skill_copy(Path::new(payload), Path::new(target), target_kind)
+    {
+        eprintln!("could not publish fresh skill copy: {error}");
+        return 1;
+    }
+    0
 }
 
 fn run_install_keybinding<'a>(args: impl Iterator<Item = &'a String>) -> i32 {

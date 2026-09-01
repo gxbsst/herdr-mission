@@ -5,13 +5,48 @@
 
 ## 安装
 
-作为 herdr 插件从 GitHub 安装：
+推荐使用 GitHub Release 的统一安装器，一次安装 Herdr plugin、可直接从 shell 调用的
+`herdr-mission` CLI，以及 Codex/Claude Code 的 `$herdr-mission-team` skill：
+
+```sh
+curl -fsSL https://github.com/gxbsst/herdr-mission/releases/latest/download/install.sh \
+  | sh
+```
+
+脚本从 `/dev/tty` 询问 skill 要安装给 Codex、Claude Code 或两者；stdin 可以继续安全地
+承载 `curl | sh`。无人值守安装两者：
+
+```sh
+curl -fsSL https://github.com/gxbsst/herdr-mission/releases/latest/download/install.sh \
+  | sh -s -- --yes --agents codex,claude
+```
+
+需要锁定版本时，使用同一个 tag 下的安装器；该脚本会把 plugin、CLI 与 skill 全部固定
+到这个 Release，不会再次解析 `latest`：
+
+```sh
+curl -fsSL https://github.com/gxbsst/herdr-mission/releases/download/vX.Y.Z/install.sh \
+  | sh
+```
+
+安装位置：
+
+- CLI：`~/.local/bin/herdr-mission`
+- canonical skill：`~/.local/share/herdr-mission/skills/herdr-mission-team`
+- Codex：`~/.agents/skills/herdr-mission-team`（独立受管副本）
+- Claude Code：`~/.claude/skills/herdr-mission-team`（独立受管副本）
+
+安装器不会修改 shell profile；如果 `~/.local/bin` 不在 `PATH`，会给出添加提示。遇到
+外来的同名 skill 文件、目录或 symlink 时会保留原内容并终止，不会静默覆盖。重复安装或
+升级只会更新带安装器所有权标记的普通目录，并重新核对所选副本与 canonical 内容一致。
+
+如果只需要 Herdr plugin，不需要全局 CLI 或 Agent skill，仍可使用窄安装路径：
 
 ```sh
 herdr plugin install gxbsst/herdr-mission --yes
 ```
 
-安装时 herdr 会 clone 本仓库，执行 `fetch-or-build.sh`：优先从 GitHub Releases 下载
+两种入口最终都会让 Herdr clone 本仓库并执行 `fetch-or-build.sh`：优先从 GitHub Releases 下载
 匹配版本+平台的预编译二进制并校验 SHA-256，下载失败才回退到源码编译。随后安装器会
 自动写入 Mission 看板快捷键：
 
@@ -49,7 +84,9 @@ mise exec rust@1.88.0 -- cargo test --locked
 
 打 `v*` tag 并 push 会触发 `.github/workflows/release.yml`，编译三个平台
 （macOS arm64 / macOS x86_64 / Linux x86_64-musl）并上传到 GitHub Release，
-同时生成 `SHA256SUMS` 和 `COMMIT` 供 `fetch-or-build.sh` 校验。
+同时发布已写入当前 tag 的 `install.sh`、`herdr-mission-team.skill.tar.gz`，并生成
+`SHA256SUMS` 和 `COMMIT`。CLI 与 skill archive 都由 checksum 覆盖，供统一安装器与
+`fetch-or-build.sh` 校验。
 
 ```sh
 git tag vX.Y.Z

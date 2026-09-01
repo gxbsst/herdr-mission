@@ -63,6 +63,12 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Stage unified installer payload
+        run: |
+          sed "s/@HERDR_MISSION_RELEASE_TAG@/${GITHUB_REF_NAME}/g" install.sh > dist/install.sh
+          chmod 0755 dist/install.sh
+          tar -C skills -czf dist/herdr-mission-team.skill.tar.gz herdr-mission-team
+
       - name: Build checksum and commit marker
         run: |
           cd dist
@@ -75,5 +81,6 @@ jobs:
         with:
           files: |
             dist/herdr-mission-*
+            dist/install.sh
             dist/SHA256SUMS
             dist/COMMIT
