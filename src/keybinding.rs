@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::Deserialize;
+
 const MISSION_BINDING: &str = concat!(
     "[[keys.command]]\n",
     "key = \"prefix+m\"\n",
@@ -13,6 +15,10 @@ const MISSION_BINDING: &str = concat!(
 );
 const MISSION_COMMAND: &str =
     "herdr plugin pane open --plugin weston.herdr-mission --entrypoint dashboard --focus";
+const LEGACY_MISSION_COMMANDS: &[&str] = &[
+    "weston.herdr-kit.open-mission-center",
+    "weston.herdr-mission.mission-new",
+];
 const MISSION_INLINE_COMMAND_ENTRY: &str = concat!(
     "{ key = \"prefix+m\", type = \"shell\", ",
     "command = \"herdr plugin pane open --plugin weston.herdr-mission --entrypoint dashboard --focus\", ",
@@ -95,17 +101,19 @@ pub(crate) fn install_herdr_keybinding(config_path: &Path) -> io::Result<()> {
         }
         validate_keys_shape(&parsed)?;
         let binding_state = mission_binding_state(&parsed);
+        let mut updated = content;
         match binding_state {
             MissionBindingState::Installed => return Ok(()),
             MissionBindingState::Conflict => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "prefix+m is already assigned to another Herdr command",
-                ));
+                updated = migrate_legacy_mission_binding(&updated, &parsed)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "prefix+m is already assigned to another Herdr command",
+                    )
+                })?;
             }
             MissionBindingState::Missing => {}
         }
-        let mut updated = content;
         if binding_state == MissionBindingState::Missing {
             append_mission_binding(&mut updated, &parsed)?;
         }
@@ -407,6 +415,114 @@ enum MissionBindingState {
     Missing,
     Installed,
     Conflict,
+}
+
+#[derive(Deserialize)]
+struct SpannedConfig {
+    keys: Option<SpannedKeys>,
+}
+
+#[derive(Deserialize)]
+struct SpannedKeys {
+    #[serde(default)]
+    command: Vec<SpannedCommand>,
+}
+
+#[derive(Deserialize)]
+struct SpannedCommand {
+    key: Option<toml::Spanned<toml::Value>>,
+    #[serde(rename = "type")]
+    kind: Option<toml::Spanned<String>>,
+    command: Option<toml::Spanned<String>>,
+    description: Option<toml::Spanned<String>>,
+}
+
+fn migrate_legacy_mission_binding(
+    content: &str,
+    config: &toml::Value,
+) -> io::Result<Option<String>> {
+    if config
+        .get("keys")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|keys| {
+            keys.iter().any(|(name, value)| {
+                !matches!(name.as_str(), "prefix" | "command") && value_uses_prefix_m(value)
+            })
+        })
+    {
+        return Ok(None);
+    }
+
+    let spanned = toml::from_str::<SpannedConfig>(content).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Herdr config keybindings could not be inspected safely: {error}"),
+        )
+    })?;
+    let Some(keys) = spanned.keys else {
+        return Ok(None);
+    };
+    let mut prefix_bindings = keys.command.iter().filter(|binding| {
+        binding.key.as_ref().and_then(|key| key.get_ref().as_str()) == Some("prefix+m")
+    });
+    let Some(legacy) = prefix_bindings.next() else {
+        return Ok(None);
+    };
+    if prefix_bindings.next().is_some()
+        || legacy
+            .kind
+            .as_ref()
+            .map(toml::Spanned::get_ref)
+            .map(String::as_str)
+            != Some("plugin_action")
+        || !legacy
+            .command
+            .as_ref()
+            .is_some_and(|command| LEGACY_MISSION_COMMANDS.contains(&command.get_ref().as_str()))
+    {
+        return Ok(None);
+    }
+
+    let mut replacements = vec![
+        (
+            legacy.kind.as_ref().unwrap().span(),
+            String::from("\"shell\""),
+        ),
+        (
+            legacy.command.as_ref().unwrap().span(),
+            format!("\"{MISSION_COMMAND}\""),
+        ),
+    ];
+    if legacy.description.as_ref().is_some_and(|description| {
+        matches!(
+            description.get_ref().as_str(),
+            "打开 Mission 控制中心" | "新建 Team Mission"
+        )
+    }) {
+        replacements.push((
+            legacy.description.as_ref().unwrap().span(),
+            String::from("\"打开 Mission 看板\""),
+        ));
+    }
+    replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+
+    let mut updated = content.to_owned();
+    for (range, replacement) in replacements {
+        updated.replace_range(range, &replacement);
+    }
+    let reparsed = updated.parse::<toml::Value>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("migrated Herdr config is not valid TOML: {error}"),
+        )
+    })?;
+    if mission_binding_state(&reparsed) != MissionBindingState::Installed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "migrated Herdr Mission keybinding could not be verified",
+        ));
+    }
+    Ok(Some(updated))
 }
 
 fn mission_binding_state(config: &toml::Value) -> MissionBindingState {

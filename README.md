@@ -53,6 +53,7 @@ herdr plugin install gxbsst/herdr-mission --yes
 - 尚无 Herdr `config.toml` 时创建 `prefix = "ctrl+a"`，按 `ctrl+a` 后再按 `m` 打开看板。
 - 已有显式 prefix 时保持不变，仍使用该 prefix 后再按 `m`。
 - 已有配置但未显式声明 prefix 时保持 Herdr 默认 `ctrl+b`，不会改动其他快捷键的 prefix。
+- 已知的旧 Mission 绑定（Herdr Kit Mission center 或早期 `mission-new`）会原子迁移到当前看板命令。
 - `prefix+m` 已被其他命令占用时安装失败，原配置保持不变。
 
 这是 Herdr 0.8.2 的插件生命周期限制下采用的安装期配置：plugin manifest 不能原生声明

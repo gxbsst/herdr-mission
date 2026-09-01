@@ -296,6 +296,66 @@ fn reinstall_keeps_a_single_mission_shortcut() {
 }
 
 #[test]
+fn legacy_mission_shortcut_is_migrated_and_reinstall_is_idempotent() {
+    let fixture = ConfigFixture::new("legacy-mission-shortcut");
+    fixture.write(concat!(
+        "[keys]\n",
+        "prefix = \"ctrl+a\"\n",
+        "\n",
+        "[[keys.command]]\n",
+        "key = \"prefix+m\"\n",
+        "type = \"plugin_action\"\n",
+        "command = \"weston.herdr-kit.open-mission-center\"\n",
+        "description = \"打开 Mission 控制中心\"\n",
+        "\n",
+        "[[keys.command]]\n",
+        "key = \"prefix+f\"\n",
+        "type = \"shell\"\n",
+        "command = \"open-files\"\n",
+    ));
+
+    let first = fixture.run();
+
+    assert_success(&first);
+    let migrated = fixture.read();
+    assert_eq!(migrated.matches("key = \"prefix+m\"").count(), 1);
+    assert!(migrated.contains(
+        "command = \"herdr plugin pane open --plugin weston.herdr-mission --entrypoint dashboard --focus\""
+    ));
+    assert!(!migrated.contains("weston.herdr-kit.open-mission-center"));
+    assert!(migrated.contains("command = \"open-files\""));
+
+    let second = fixture.run();
+
+    assert_success(&second);
+    assert_eq!(fixture.read(), migrated);
+}
+
+#[test]
+fn inline_legacy_mission_new_shortcut_is_migrated_without_reformatting() {
+    let fixture = ConfigFixture::new("inline-legacy-mission-new-shortcut");
+    fixture.write(concat!(
+        "keys = { prefix = \"ctrl+a\", command = [",
+        "{ key = \"prefix+m\", type = \"plugin_action\", command = \"weston.herdr-mission.mission-new\", description = \"新建 Team Mission\" }, ",
+        "{ key = \"prefix+f\", type = \"shell\", command = \"open-files\" }",
+        "] } # keep inline keys\n",
+    ));
+
+    let output = fixture.run();
+
+    assert_success(&output);
+    assert_eq!(
+        fixture.read(),
+        concat!(
+            "keys = { prefix = \"ctrl+a\", command = [",
+            "{ key = \"prefix+m\", type = \"shell\", command = \"herdr plugin pane open --plugin weston.herdr-mission --entrypoint dashboard --focus\", description = \"打开 Mission 看板\" }, ",
+            "{ key = \"prefix+f\", type = \"shell\", command = \"open-files\" }",
+            "] } # keep inline keys\n",
+        )
+    );
+}
+
+#[test]
 fn occupied_prefix_m_fails_without_changing_user_config() {
     let fixture = ConfigFixture::new("occupied-prefix-m");
     let original = concat!(
@@ -319,6 +379,50 @@ fn occupied_prefix_m_fails_without_changing_user_config() {
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["status"], "error");
+    assert_eq!(result["error"]["code"], "keybinding_conflict");
+    assert_eq!(fixture.read(), original);
+}
+
+#[test]
+fn legacy_command_with_noncanonical_type_remains_a_conflict() {
+    let fixture = ConfigFixture::new("legacy-command-wrong-type");
+    let original = concat!(
+        "[keys]\n",
+        "prefix = \"ctrl+a\"\n",
+        "\n",
+        "[[keys.command]]\n",
+        "key = \"prefix+m\"\n",
+        "type = \"shell\"\n",
+        "command = \"weston.herdr-kit.open-mission-center\"\n",
+    );
+    fixture.write(original);
+
+    let output = fixture.run();
+
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "keybinding_conflict");
+    assert_eq!(fixture.read(), original);
+}
+
+#[test]
+fn legacy_multi_key_binding_remains_a_conflict_without_retargeting_other_keys() {
+    let fixture = ConfigFixture::new("legacy-multi-key-binding");
+    let original = concat!(
+        "[keys]\n",
+        "prefix = \"ctrl+a\"\n",
+        "\n",
+        "[[keys.command]]\n",
+        "key = [\"prefix+m\", \"prefix+n\"]\n",
+        "type = \"plugin_action\"\n",
+        "command = \"weston.herdr-mission.mission-new\"\n",
+    );
+    fixture.write(original);
+
+    let output = fixture.run();
+
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["error"]["code"], "keybinding_conflict");
     assert_eq!(fixture.read(), original);
 }
@@ -468,6 +572,10 @@ fn plugin_install_manifest_runs_keybinding_setup_after_binary_build() {
             .unwrap()
             .parse::<toml::Value>()
             .unwrap();
+    assert_eq!(
+        manifest["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
     let builds = manifest["build"].as_array().unwrap();
 
     assert_eq!(builds.len(), 2);

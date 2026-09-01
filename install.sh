@@ -36,7 +36,7 @@ Usage: install.sh [--yes] [--agents codex|claude|codex,claude] [--version vX.Y.Z
 
 Options:
   --agents <selection>  Install the skill for Codex, Claude Code, or both.
-  --version <tag>       Install one explicit release tag (for example v0.1.11).
+  --version <tag>       Install one explicit release tag (for example v0.1.13).
   --yes                 Skip the final confirmation prompt.
   -h, --help            Show this help.
 EOF
