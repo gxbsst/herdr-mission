@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::{
-        raw::{c_char, c_int, c_uint},
+        raw::{c_int, c_uint},
         unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd},
     },
     path::{Path, PathBuf},
@@ -170,9 +170,9 @@ fn rename_noreplace(
     unsafe extern "C" {
         fn renameatx_np(
             from_fd: c_int,
-            from: *const c_char,
+            from: *const std::os::raw::c_char,
             to_fd: c_int,
-            to: *const c_char,
+            to: *const std::os::raw::c_char,
             flags: c_uint,
         ) -> c_int;
     }
@@ -197,30 +197,29 @@ fn rename_noreplace(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn rename_noreplace(
     parent_fd: c_int,
     source: &std::ffi::OsStr,
     target: &std::ffi::OsStr,
 ) -> io::Result<()> {
+    const SYS_RENAMEAT2: std::os::raw::c_long = 316;
     const RENAME_NOREPLACE: c_uint = 1;
 
     unsafe extern "C" {
-        fn renameat2(
-            from_fd: c_int,
-            from: *const c_char,
-            to_fd: c_int,
-            to: *const c_char,
-            flags: c_uint,
-        ) -> c_int;
+        fn syscall(number: std::os::raw::c_long, ...) -> std::os::raw::c_long;
     }
 
     let source = name_to_c_string(source)?;
     let target = name_to_c_string(target)?;
-    // SAFETY: the parent FD remains open, both names are NUL-terminated C
-    // strings, and RENAME_NOREPLACE rejects an existing target atomically.
+    // SAFETY: Linux x86_64 assigns syscall 316 to renameat2. The parent FD
+    // remains open, both names are NUL-terminated C strings, and the argument
+    // types match renameat2(2). RENAME_NOREPLACE rejects an existing target
+    // atomically. Calling syscall avoids relying on a libc renameat2 symbol,
+    // which musl intentionally does not export.
     let result = unsafe {
-        renameat2(
+        syscall(
+            SYS_RENAMEAT2,
             parent_fd,
             source.as_ptr(),
             parent_fd,
@@ -233,6 +232,18 @@ fn rename_noreplace(
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+fn rename_noreplace(
+    _parent_fd: c_int,
+    _source: &std::ffi::OsStr,
+    _target: &std::ffi::OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic skill publication is only supported on Linux x86_64",
+    ))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
