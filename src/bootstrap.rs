@@ -12,7 +12,7 @@ use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
-use crate::{ErrorCategory, KernelError};
+use crate::{peer::migrate_peer_schema, ErrorCategory, KernelError};
 
 /// Stable owner identity written into every Rust-owned database.
 pub const OWNER_IDENTITY: &str = "herdr-mission";
@@ -110,6 +110,7 @@ pub fn bootstrap_database(database: &Path) -> Result<BootstrapOutcome, KernelErr
     })?;
     migrate_mission_state(&transaction)
         .map_err(|error| sqlite_error("sqlite_migration_failed", "migrate_mission_state", error))?;
+    migrate_peer_schema(&transaction)?;
     transaction
         .execute(
             "INSERT INTO schema_meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO NOTHING",

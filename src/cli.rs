@@ -7,6 +7,7 @@
 
 use std::{
     collections::BTreeMap,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -14,17 +15,20 @@ use serde_json::json;
 
 use crate::keybinding::{default_herdr_config_path, install_herdr_keybinding};
 use crate::{
-    agent_name_token, agent_rename_argv, bootstrap_database, compute_manifest, create_mission,
-    delete_mission, herdr_bin, is_valid_role_identity, kernel_deliver, kernel_dispatch_command,
-    kernel_read_context, kernel_reconcile, kernel_reply_command, launch_mission, list_missions,
-    make_mission_id, manifest_path_for, open_writable, pane_rename_argv, read_generation,
-    read_manifest, read_mission_launch_mode, read_mission_status, read_role_runtime,
-    record_role_runtime, request_stop, resolve_mission_id, resolve_roles, run_daemon, run_tui,
-    set_mission_launch_mode, source_cwd, start_role, utc_timestamp, verify_binary,
-    workspace_close_argv, write_manifest, CreateMissionRequest, ErrorCategory, KernelError,
-    LaunchConfig, LaunchMode, LaunchOptions, LaunchedRole, MissionLayout, ProcessRunner, Provider,
-    RoleOverride, SystemProcessRunner, WorkspaceSource, OWNER_IDENTITY, PROTOCOL_VERSION,
-    SCHEMA_VERSION,
+    acknowledge_peer_message, agent_list_argv, agent_name_token, agent_rename_argv,
+    bootstrap_database, compute_manifest, configure_local_peer, create_mission, delete_mission,
+    deliver_peer_messages_with, herdr_bin, is_valid_role_identity, kernel_deliver,
+    kernel_dispatch_command, kernel_read_context, kernel_reconcile_with_peer, kernel_reply_command,
+    launch_mission, list_missions, make_mission_id, manifest_path_for, new_peer_message_id,
+    notify_peer_inboxes, open_writable, pane_rename_argv, parse_agent_list, queue_peer_message,
+    read_generation, read_manifest, read_mission_launch_mode, read_mission_status, read_peer_inbox,
+    read_role_runtime, receive_peer_envelope, record_role_runtime, request_stop,
+    resolve_mission_id, resolve_roles, run_daemon, run_tui, set_mission_launch_mode, source_cwd,
+    start_role, upsert_peer, upsert_peer_route, utc_timestamp, verify_binary, workspace_close_argv,
+    write_manifest, CreateMissionRequest, ErrorCategory, KernelError, LaunchConfig, LaunchMode,
+    LaunchOptions, LaunchedRole, MissionLayout, PeerSendRequest, ProcessRunner, Provider,
+    RoleOverride, SystemProcessRunner, SystemSshPeerTransport, WorkspaceSource,
+    MAX_PEER_ENVELOPE_BYTES, OWNER_IDENTITY, PROTOCOL_VERSION, SCHEMA_VERSION,
 };
 
 /// Exit code for an unknown subcommand (distinct from malformed input).
@@ -47,6 +51,7 @@ pub fn run(args: &[String]) -> i32 {
         Some("list") => run_list(iter),
         Some("init") => run_init(iter),
         Some("send") => run_send(iter),
+        Some("peer") => run_peer(iter),
         Some("reply") => run_reply(iter),
         Some("deliver") => run_deliver(iter),
         Some("reconcile") => run_reconcile(iter),
@@ -217,6 +222,7 @@ fn print_usage() -> i32 {
            set-launch-mode  切换 Mission 的 Auto/Manual 模式\n\
            init        读取角色待办与收件箱\n\
            send        派发 Assignment 给目标角色\n\
+           peer        跨 Mission / 跨设备 PM relay\n\
            reply       回执 Assignment\n\
            deliver     投递 outbox\n\
            reconcile   协调 Agent 实时状态并投递 outbox\n\
@@ -901,6 +907,19 @@ fn run_init<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                             "kind": m.kind.clone(),
                             "body": m.body.clone(),
                         })).collect::<Vec<_>>(),
+                        "peer_inbox": context.peer_inbox.iter().map(|m| json!({
+                            "message_id": m.message_id.clone(),
+                            "source_peer_id": m.source_peer_id.clone(),
+                            "target_peer_id": m.target_peer_id.clone(),
+                            "source_mission_id": m.source_mission_id.clone(),
+                            "target_mission_id": m.target_mission_id.clone(),
+                            "source_pm_generation": m.source_pm_generation.clone(),
+                            "kind": m.kind.clone(),
+                            "body": m.body.clone(),
+                            "in_reply_to": m.in_reply_to.clone(),
+                            "payload_sha256": m.payload_sha256.clone(),
+                            "received_at": m.received_at.clone(),
+                        })).collect::<Vec<_>>(),
                     }))
                     .expect("init outcome must serialize")
                 );
@@ -919,6 +938,17 @@ fn run_init<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                         assignment.state, assignment.id, assignment.kind
                     );
                 }
+                for message in &context.peer_inbox {
+                    println!(
+                        "  - peer {} from {}:{} to {}:{} ({})",
+                        message.message_id,
+                        message.source_peer_id,
+                        message.source_mission_id,
+                        message.target_peer_id,
+                        message.target_mission_id,
+                        message.kind
+                    );
+                }
             }
             0
         }
@@ -930,8 +960,13 @@ fn run_send<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
     let mut mission_id: Option<String> = None;
     let mut role: Option<String> = None;
     let mut target: Option<String> = None;
+    let mut target_mission: Option<String> = None;
+    let mut peer_id: Option<String> = None;
     let mut kind = "task".to_string();
+    let mut kind_explicit = false;
     let mut body: Option<String> = None;
+    let mut message_id: Option<String> = None;
+    let mut in_reply_to: Option<String> = None;
     let mut database: Option<PathBuf> = None;
     let mut json_mode = false;
 
@@ -953,13 +988,20 @@ fn run_send<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
             "--mission-id" | "--mission" => mission_id = value,
             "--role" => role = value,
             "--target" => target = value,
-            "--kind" => kind = value.unwrap_or_else(|| "task".into()),
+            "--target-mission" => target_mission = value,
+            "--peer" => peer_id = value,
+            "--kind" => {
+                kind_explicit = true;
+                kind = value.unwrap_or_else(|| "task".into());
+            }
             "--body" => body = value,
+            "--message-id" => message_id = value,
+            "--in-reply-to" => in_reply_to = value,
             "--database" => database = value.map(PathBuf::from),
             "--help" | "-h" => {
                 return command_help(
                     "send",
-                    "--mission-id <id> --role <source> --target <target> --kind <task|fix|context> --body '<text>' [--database <path>] [--json]",
+                    "--mission-id <id> --role <source> --target <target> --kind <task|fix|context> --body '<text>' [--target-mission <id> [--peer <id>] --kind <delegate|context|result|blocked>] [--database <path>] [--json]",
                 );
             }
             other => {
@@ -1023,6 +1065,53 @@ fn run_send<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
         }
     };
 
+    if target == "pm" {
+        if let Some(target_mission) = target_mission {
+            let mut values = BTreeMap::from([
+                ("mission-id".into(), mission_id),
+                ("role".into(), role),
+                ("target-mission".into(), target_mission),
+                (
+                    "kind".into(),
+                    if kind_explicit {
+                        kind
+                    } else {
+                        "context".into()
+                    },
+                ),
+                ("body".into(), body),
+                ("database".into(), database.to_string_lossy().into_owned()),
+            ]);
+            if let Some(peer_id) = peer_id {
+                values.insert("peer".into(), peer_id);
+            }
+            if let Some(message_id) = message_id {
+                values.insert("message-id".into(), message_id);
+            }
+            if let Some(in_reply_to) = in_reply_to {
+                values.insert("in-reply-to".into(), in_reply_to);
+            }
+            return run_peer_send(
+                &database,
+                &PeerCliArgs {
+                    values,
+                    json: json_mode,
+                },
+            );
+        }
+    }
+    if target_mission.is_some()
+        || peer_id.is_some()
+        || message_id.is_some()
+        || in_reply_to.is_some()
+    {
+        return cli_fail(
+            json_mode,
+            malformed("peer routing options require --target=pm and --target-mission"),
+            EXIT_MALFORMED_ARGS,
+        );
+    }
+
     match kernel_dispatch_command(&database, &mission_id, &role, &target, &kind, &body) {
         Ok(outcome) => {
             deliver_now(&database);
@@ -1049,6 +1138,387 @@ fn run_send<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
         }
         Err(error) => cli_fail(json_mode, error, 1),
     }
+}
+
+fn run_peer<'a>(mut args: impl Iterator<Item = &'a String>) -> i32 {
+    let Some(command) = args.next().map(String::as_str) else {
+        return command_help(
+            "peer",
+            "<identity|add|link|send|receive|inbox|ack|deliver> [options]",
+        );
+    };
+    let parsed = match parse_peer_cli_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => return cli_fail(false, error, EXIT_MALFORMED_ARGS),
+    };
+    let database = match parsed
+        .values
+        .get("database")
+        .map(PathBuf::from)
+        .or_else(default_database)
+    {
+        Some(path) => path,
+        None => {
+            return cli_fail(
+                parsed.json,
+                malformed("cannot resolve a state directory or HOME for default database path"),
+                EXIT_MALFORMED_ARGS,
+            );
+        }
+    };
+    match command {
+        "identity" => run_peer_identity(&database, &parsed),
+        "add" => run_peer_add(&database, &parsed),
+        "link" => run_peer_link(&database, &parsed),
+        "send" => run_peer_send(&database, &parsed),
+        "receive" => run_peer_receive(&database, &parsed),
+        "inbox" => run_peer_inbox(&database, &parsed),
+        "ack" => run_peer_ack(&database, &parsed),
+        "deliver" => run_peer_deliver(&database, &parsed),
+        "--help" | "-h" | "help" => command_help(
+            "peer",
+            "<identity|add|link|send|receive|inbox|ack|deliver> [options]",
+        ),
+        other => cli_fail(
+            parsed.json,
+            malformed(format!("unknown peer command: {other}")),
+            EXIT_MALFORMED_ARGS,
+        ),
+    }
+}
+
+#[derive(Debug, Default)]
+struct PeerCliArgs {
+    values: BTreeMap<String, String>,
+    json: bool,
+}
+
+fn parse_peer_cli_args<'a>(
+    args: impl Iterator<Item = &'a String>,
+) -> Result<PeerCliArgs, KernelError> {
+    let mut parsed = PeerCliArgs::default();
+    let mut args = args.peekable();
+    while let Some(argument) = args.next() {
+        if argument == "--json" {
+            parsed.json = true;
+            continue;
+        }
+        let (raw_key, inline) = match argument.split_once('=') {
+            Some((key, value)) => (key, Some(value.to_string())),
+            None => (argument.as_str(), None),
+        };
+        let Some(key) = raw_key.strip_prefix("--") else {
+            return Err(malformed(format!("unexpected argument: {argument}")));
+        };
+        if key.is_empty() || key == "json" {
+            return Err(malformed(format!("unexpected argument: {argument}")));
+        }
+        let value = match inline {
+            Some(value) => value,
+            None => args
+                .next()
+                .filter(|value| !value.starts_with("--"))
+                .cloned()
+                .ok_or_else(|| malformed(format!("--{key} requires a value")))?,
+        };
+        if parsed.values.insert(key.to_string(), value).is_some() {
+            return Err(malformed(format!("--{key} was provided more than once")));
+        }
+    }
+    Ok(parsed)
+}
+
+fn peer_required<'a>(parsed: &'a PeerCliArgs, key: &str) -> Result<&'a str, KernelError> {
+    parsed
+        .values
+        .get(key)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| malformed(format!("--{key} is required")))
+}
+
+fn reject_unknown_peer_options(parsed: &PeerCliArgs, allowed: &[&str]) -> Result<(), KernelError> {
+    if let Some(key) = parsed
+        .values
+        .keys()
+        .find(|key| key.as_str() != "database" && !allowed.contains(&key.as_str()))
+    {
+        return Err(malformed(format!("unexpected argument: --{key}")));
+    }
+    Ok(())
+}
+
+fn run_peer_identity(database: &Path, parsed: &PeerCliArgs) -> i32 {
+    if let Err(error) = reject_unknown_peer_options(parsed, &["local-peer"]) {
+        return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS);
+    }
+    let local_peer = match peer_required(parsed, "local-peer") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    match configure_local_peer(database, local_peer) {
+        Ok(()) => peer_cli_ok(parsed.json, json!({"local_peer_id": local_peer})),
+        Err(error) => cli_fail(parsed.json, error, 1),
+    }
+}
+
+fn run_peer_add(database: &Path, parsed: &PeerCliArgs) -> i32 {
+    if let Err(error) = reject_unknown_peer_options(parsed, &["peer", "ssh"]) {
+        return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS);
+    }
+    let peer_id = match peer_required(parsed, "peer") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    let ssh = match peer_required(parsed, "ssh") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    match upsert_peer(database, peer_id, ssh) {
+        Ok(()) => peer_cli_ok(
+            parsed.json,
+            json!({"peer_id": peer_id, "ssh_destination": ssh}),
+        ),
+        Err(error) => cli_fail(parsed.json, error, 1),
+    }
+}
+
+fn run_peer_link(database: &Path, parsed: &PeerCliArgs) -> i32 {
+    if let Err(error) = reject_unknown_peer_options(
+        parsed,
+        &["peer", "local-mission", "remote-mission", "direction"],
+    ) {
+        return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS);
+    }
+    let peer_id = match peer_required(parsed, "peer") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    let local_mission = match peer_required(parsed, "local-mission") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    let remote_mission = match peer_required(parsed, "remote-mission") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    let direction = parsed
+        .values
+        .get("direction")
+        .map(String::as_str)
+        .unwrap_or("bidirectional");
+    match upsert_peer_route(database, peer_id, local_mission, remote_mission, direction) {
+        Ok(()) => peer_cli_ok(
+            parsed.json,
+            json!({
+                "peer_id": peer_id,
+                "local_mission_id": local_mission,
+                "remote_mission_id": remote_mission,
+                "direction": direction,
+            }),
+        ),
+        Err(error) => cli_fail(parsed.json, error, 1),
+    }
+}
+
+fn run_peer_send(database: &Path, parsed: &PeerCliArgs) -> i32 {
+    if let Err(error) = reject_unknown_peer_options(
+        parsed,
+        &[
+            "mission-id",
+            "role",
+            "target-mission",
+            "peer",
+            "kind",
+            "body",
+            "message-id",
+            "in-reply-to",
+        ],
+    ) {
+        return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS);
+    }
+    let source_mission = match peer_required(parsed, "mission-id") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    let role = parsed
+        .values
+        .get("role")
+        .map(String::as_str)
+        .unwrap_or("pm");
+    let target_mission = match peer_required(parsed, "target-mission") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    let kind = parsed
+        .values
+        .get("kind")
+        .map(String::as_str)
+        .unwrap_or("context");
+    let body = match peer_required(parsed, "body") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    let message_id = parsed
+        .values
+        .get("message-id")
+        .cloned()
+        .unwrap_or_else(new_peer_message_id);
+    let request = PeerSendRequest {
+        message_id,
+        source_mission_id: source_mission.into(),
+        target_mission_id: target_mission.into(),
+        source_role: role.into(),
+        peer_id: parsed.values.get("peer").cloned(),
+        kind: kind.into(),
+        body: body.into(),
+        in_reply_to: parsed.values.get("in-reply-to").cloned(),
+    };
+    match queue_peer_message(database, &request) {
+        Ok(outcome) => {
+            let runner = SystemProcessRunner;
+            let delivery = if request.peer_id.is_some() {
+                deliver_peer_messages_with(database, &SystemSshPeerTransport)
+                    .map(|report| json!(report))
+            } else {
+                notify_peer_inboxes(database, &runner, &herdr_bin()).map(|report| json!(report))
+            };
+            let delivery = match delivery {
+                Ok(report) => report,
+                Err(error) => json!({"status": "queued", "error": error}),
+            };
+            peer_cli_ok(
+                parsed.json,
+                json!({
+                    "message_id": outcome.message_id,
+                    "payload_sha256": outcome.payload_sha256,
+                    "state": outcome.state,
+                    "duplicate": outcome.duplicate,
+                    "delivery": delivery,
+                }),
+            )
+        }
+        Err(error) => cli_fail(parsed.json, error, 1),
+    }
+}
+
+fn run_peer_receive(database: &Path, parsed: &PeerCliArgs) -> i32 {
+    if let Err(error) = reject_unknown_peer_options(parsed, &["peer"]) {
+        return cli_fail(true, error, EXIT_MALFORMED_ARGS);
+    }
+    let peer_id = match peer_required(parsed, "peer") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(true, error, EXIT_MALFORMED_ARGS),
+    };
+    let mut envelope = Vec::new();
+    let limit = u64::try_from(MAX_PEER_ENVELOPE_BYTES + 1).unwrap_or(u64::MAX);
+    if let Err(error) = std::io::stdin().take(limit).read_to_end(&mut envelope) {
+        return cli_fail(
+            true,
+            KernelError {
+                category: ErrorCategory::Transport,
+                code: "peer_stdin_read_failed".into(),
+                message: "failed to read peer envelope from stdin".into(),
+                retryable: false,
+                details: BTreeMap::from([("reason".into(), json!(error.to_string()))]),
+            },
+            1,
+        );
+    }
+    match receive_peer_envelope(database, peer_id, &envelope) {
+        Ok(receipt) => {
+            println!(
+                "{}",
+                serde_json::to_string(&receipt).expect("peer receipt must serialize")
+            );
+            let runner = SystemProcessRunner;
+            if let Err(error) = notify_peer_inboxes(database, &runner, &herdr_bin()) {
+                crate::log_error(database, "peer_receive_notify", &error);
+            }
+            0
+        }
+        Err(error) => cli_fail(true, error, 1),
+    }
+}
+
+fn run_peer_inbox(database: &Path, parsed: &PeerCliArgs) -> i32 {
+    if let Err(error) = reject_unknown_peer_options(parsed, &["mission-id", "role"]) {
+        return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS);
+    }
+    let mission_id = match peer_required(parsed, "mission-id") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    let role = parsed
+        .values
+        .get("role")
+        .map(String::as_str)
+        .unwrap_or("pm");
+    match read_peer_inbox(database, mission_id, role) {
+        Ok(messages) => peer_cli_ok(parsed.json, json!({"peer_inbox": messages})),
+        Err(error) => cli_fail(parsed.json, error, 1),
+    }
+}
+
+fn run_peer_ack(database: &Path, parsed: &PeerCliArgs) -> i32 {
+    if let Err(error) = reject_unknown_peer_options(parsed, &["mission-id", "role", "message-id"]) {
+        return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS);
+    }
+    let mission_id = match peer_required(parsed, "mission-id") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    let role = parsed
+        .values
+        .get("role")
+        .map(String::as_str)
+        .unwrap_or("pm");
+    let message_id = match peer_required(parsed, "message-id") {
+        Ok(value) => value,
+        Err(error) => return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS),
+    };
+    match acknowledge_peer_message(database, mission_id, role, message_id) {
+        Ok(changed) => peer_cli_ok(
+            parsed.json,
+            json!({"message_id": message_id, "acknowledged": true, "changed": changed}),
+        ),
+        Err(error) => cli_fail(parsed.json, error, 1),
+    }
+}
+
+fn run_peer_deliver(database: &Path, parsed: &PeerCliArgs) -> i32 {
+    if let Err(error) = reject_unknown_peer_options(parsed, &[]) {
+        return cli_fail(parsed.json, error, EXIT_MALFORMED_ARGS);
+    }
+    let runner = SystemProcessRunner;
+    let delivery = deliver_peer_messages_with(database, &SystemSshPeerTransport);
+    let notification = notify_peer_inboxes(database, &runner, &herdr_bin());
+    match (delivery, notification) {
+        (Ok(delivery), Ok(notification)) => peer_cli_ok(
+            parsed.json,
+            json!({
+                "sent": delivery.sent,
+                "retried": delivery.retried,
+                "notified": notification.notified,
+                "notify_failed": notification.notify_failed,
+            }),
+        ),
+        (Err(error), _) | (_, Err(error)) => cli_fail(parsed.json, error, 1),
+    }
+}
+
+fn peer_cli_ok(json_mode: bool, fields: serde_json::Value) -> i32 {
+    if json_mode {
+        let mut value = fields.as_object().cloned().unwrap_or_default();
+        value.insert("status".into(), json!("ok"));
+        println!(
+            "{}",
+            serde_json::to_string(&value).expect("peer CLI outcome must serialize")
+        );
+    } else {
+        println!("{fields}");
+    }
+    0
 }
 
 fn run_reply<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
@@ -1265,13 +1735,16 @@ fn run_reconcile<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
     };
 
     let runner = SystemProcessRunner;
-    let report = kernel_reconcile(&database, &runner, &herdr_bin());
+    let report = kernel_reconcile_with_peer(&database, &runner, &herdr_bin());
     let health_ok = report.health.is_ok();
     let delivery_ok = report.delivery.is_ok();
-    let status = match (health_ok, delivery_ok) {
-        (true, true) => "ok",
-        (false, false) => "error",
-        _ => "partial",
+    let peer_ok = report.peer.is_ok();
+    let status = if health_ok && delivery_ok && peer_ok {
+        "ok"
+    } else if !health_ok && !delivery_ok && !peer_ok {
+        "error"
+    } else {
+        "partial"
     };
     let health = match report.health {
         Ok(health) => json!({
@@ -1290,6 +1763,16 @@ fn run_reconcile<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
         }),
         Err(error) => json!({"status": "error", "error": error}),
     };
+    let peer = match report.peer {
+        Ok(peer) => json!({
+            "status": "ok",
+            "sent": peer.sent,
+            "retried": peer.retried,
+            "notified": peer.notified,
+            "notify_failed": peer.notify_failed,
+        }),
+        Err(error) => json!({"status": "error", "error": error}),
+    };
 
     if json_mode {
         println!(
@@ -1298,14 +1781,15 @@ fn run_reconcile<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
                 "status": status,
                 "health": health,
                 "delivery": delivery,
+                "peer": peer,
             }))
             .expect("reconcile outcome must serialize")
         );
     } else {
-        println!("status={status} health={health} delivery={delivery}");
+        println!("status={status} health={health} delivery={delivery} peer={peer}");
     }
 
-    if health_ok && delivery_ok {
+    if health_ok && delivery_ok && peer_ok {
         0
     } else {
         1
@@ -1745,20 +2229,17 @@ fn run_join<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
     let agent_name =
         agent_name.unwrap_or_else(|| format!("mission-{}-{role}", agent_name_token(&mission_id)));
 
-    if let Err(error) = record_role_runtime(&database, &mission_id, &role, &pane, &agent_name) {
-        return cli_fail(json_mode, error, 1);
-    }
-
     let runner = SystemProcessRunner;
     let _ = runner.run(
         &herdr_bin(),
         &pane_rename_argv(&pane, &format!("⚑ {mission_id} › {role}")),
     );
-    // Register the fabricated agent name with Herdr so the delivery wake-up
-    // (`herdr agent prompt <name>`) can resolve this pane. Without this,
-    // manually joined roles never leave `queued` because the agent target is
-    // `agent_not_found`.
-    let _ = runner.run(&herdr_bin(), &agent_rename_argv(&pane, &agent_name));
+    if let Err(error) = verify_joined_agent_identity(&runner, &herdr_bin(), &pane, &agent_name) {
+        return cli_fail(json_mode, error, 1);
+    }
+    if let Err(error) = record_role_runtime(&database, &mission_id, &role, &pane, &agent_name) {
+        return cli_fail(json_mode, error, 1);
+    }
     notify_pm_of_join(&database, &mission_id, &role);
 
     if json_mode {
@@ -1781,6 +2262,92 @@ fn run_join<'a>(args: impl Iterator<Item = &'a String>) -> i32 {
         );
     }
     0
+}
+
+fn verify_joined_agent_identity(
+    runner: &dyn ProcessRunner,
+    herdr: &str,
+    pane_id: &str,
+    agent_name: &str,
+) -> Result<(), KernelError> {
+    let renamed = runner
+        .run(herdr, &agent_rename_argv(pane_id, agent_name))
+        .map_err(|error| {
+            role_runtime_process_failed("role_agent_rename_failed", "agent rename", error)
+        })?;
+    if renamed.exit_code != 0 {
+        return Err(role_runtime_command_failed(
+            "role_agent_rename_failed",
+            "agent rename",
+            renamed.exit_code,
+        ));
+    }
+
+    let listed = runner.run(herdr, &agent_list_argv()).map_err(|error| {
+        role_runtime_process_failed("role_agent_list_failed", "agent list", error)
+    })?;
+    if listed.exit_code != 0 {
+        return Err(role_runtime_command_failed(
+            "role_agent_list_failed",
+            "agent list",
+            listed.exit_code,
+        ));
+    }
+    let agents = parse_agent_list(&listed.stdout)?;
+    let exact = agents
+        .iter()
+        .filter(|agent| agent.pane_id == pane_id && agent.name.as_deref() == Some(agent_name))
+        .count();
+    let pane_matches = agents
+        .iter()
+        .filter(|agent| agent.pane_id == pane_id)
+        .count();
+    let name_matches = agents
+        .iter()
+        .filter(|agent| agent.name.as_deref() == Some(agent_name))
+        .count();
+    if exact != 1 || pane_matches != 1 || name_matches != 1 {
+        return Err(KernelError {
+            category: ErrorCategory::Contract,
+            code: "role_runtime_identity_unverified".into(),
+            message: "joined role did not resolve to one exact live Agent binding".into(),
+            retryable: false,
+            details: BTreeMap::from([
+                ("agent_name".into(), json!(agent_name)),
+                ("exact_matches".into(), json!(exact)),
+                ("name_matches".into(), json!(name_matches)),
+                ("pane_id".into(), json!(pane_id)),
+                ("pane_matches".into(), json!(pane_matches)),
+            ]),
+        });
+    }
+    Ok(())
+}
+
+fn role_runtime_process_failed(code: &str, operation: &str, error: std::io::Error) -> KernelError {
+    KernelError {
+        category: ErrorCategory::Infrastructure,
+        code: code.into(),
+        message: format!("{operation} could not be executed"),
+        retryable: true,
+        details: BTreeMap::from([
+            ("io_kind".into(), json!(format!("{:?}", error.kind()))),
+            ("operation".into(), json!(operation)),
+        ]),
+    }
+}
+
+fn role_runtime_command_failed(code: &str, operation: &str, exit_code: i32) -> KernelError {
+    KernelError {
+        category: ErrorCategory::Infrastructure,
+        code: code.into(),
+        message: format!("{operation} failed"),
+        retryable: true,
+        details: BTreeMap::from([
+            ("exit_code".into(), json!(exit_code)),
+            ("operation".into(), json!(operation)),
+        ]),
+    }
 }
 
 /// Write a one-line context notice into PM's inbox so PM knows a role joined.

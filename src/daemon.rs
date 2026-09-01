@@ -11,7 +11,8 @@ use std::{
 use serde_json::json;
 
 use crate::{
-    kernel_deliver, open_writable, ErrorCategory, KernelError, ProcessRunner, OWNER_IDENTITY,
+    kernel_deliver, open_writable, reconcile_peer_relay, ErrorCategory, KernelError, ProcessRunner,
+    SystemSshPeerTransport, OWNER_IDENTITY,
 };
 
 /// An exclusive lockfile guarding a single daemon instance per database.
@@ -88,6 +89,21 @@ pub fn run_daemon(
             }
             Ok(_) => {}
             Err(error) => eprintln!("delivery error: {} ({})", error.message, error.code),
+        }
+        match reconcile_peer_relay(database, &SystemSshPeerTransport, runner, herdr) {
+            Ok(report)
+                if report.sent > 0
+                    || report.retried > 0
+                    || report.notified > 0
+                    || report.notify_failed > 0 =>
+            {
+                eprintln!(
+                    "peer relay: sent={} retried={} notified={} notify_failed={}",
+                    report.sent, report.retried, report.notified, report.notify_failed
+                );
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("peer relay error: {} ({})", error.message, error.code),
         }
         std::thread::sleep(interval);
     }

@@ -35,4 +35,14 @@
 发送后立即投递，唤醒目标角色：
     {{bin}} deliver --json --database={{database}}
 
+跨 Mission 或跨设备协作必须使用 peer relay，不得把另一 Mission 的 PM 伪装成当前
+Mission 的 Worker/Scout/Reviewer，也不得直接创建跨 Mission Assignment。先在
+`init` 的 `peer_inbox` 中读取 durable 消息，再按当前 Mission 的权限和范围拆成本地
+Assignment；处理完成后 ack，并用带 `in_reply_to` 的新 peer 消息返回结果或阻塞：
+    {{bin}} peer send --json --mission-id={{mission_id}} --role=pm --target-mission=<目标 Mission> --peer=<目标 peer> --kind=delegate --body='<协作上下文>' --database={{database}}
+    {{bin}} peer ack --json --mission-id={{mission_id}} --role=pm --message-id=<peer message id> --database={{database}}
+
+同一数据库内的另一个 Mission 不需要 `--peer`。普通 `send --target=pm` 仍属于同
+Mission ACL 并会被拒绝；必须显式提供不同的 `--target-mission`。
+
 收到 Scout 的 finding、Worker 的 completed、Reviewer 的 approved/rejected 后，据此决定下一步：继续派发、要求返工，或向用户汇报结果。

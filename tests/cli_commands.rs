@@ -27,6 +27,13 @@ fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+fn write_executable(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
 fn create_cli_mission(path: &Path, title: &str) -> String {
     let output = Command::new(kernel_binary())
         .args(["new", "--json", "--no-start"])
@@ -454,6 +461,211 @@ fn reconcile_reports_health_and_delivery_results_as_structured_json() {
         )
         .unwrap();
     assert_eq!(health, "working");
+
+    let text_output = Command::new(kernel_binary())
+        .arg("reconcile")
+        .arg(format!("--database={}", path.display()))
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .output()
+        .unwrap();
+    assert!(text_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&text_output.stdout).contains(" peer="),
+        "text reconcile output omitted peer report: {}",
+        String::from_utf8_lossy(&text_output.stdout)
+    );
+
+    cleanup(&path);
+    let _ = fs::remove_file(fake_herdr);
+}
+
+#[test]
+fn join_rejects_agent_rename_failure_without_changing_the_role_binding() {
+    let path = temp_db_path("join-rename-failure");
+    let fake_herdr = path.with_extension("herdr");
+    write_executable(
+        &fake_herdr,
+        "#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = rename ]; then exit 0; fi\nif [ \"$1\" = agent ] && [ \"$2\" = rename ]; then printf '%s\\n' 'rename rejected' >&2; exit 1; fi\nexit 1\n",
+    );
+    let mission_id = create_cli_mission(&path, "Join rename failure");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles
+             SET pane_id = 'w19:pC', terminal_id = 'Codex', health = 'missing'
+             WHERE mission_id = ?1 AND role = 'pm'",
+            [&mission_id],
+        )
+        .unwrap();
+    let before: (String, String, String, String, i64) = connection
+        .query_row(
+            "SELECT pane_id, terminal_id, health, updated_at,
+                    (SELECT COUNT(*) FROM messages WHERE mission_id = ?1)
+             FROM team_roles WHERE mission_id = ?1 AND role = 'pm'",
+            [&mission_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = Command::new(kernel_binary())
+        .args([
+            "join",
+            "--json",
+            "--role=pm",
+            "--pane=w19:pC",
+            "--agent-name=mission-verified-pm",
+        ])
+        .arg(format!("--mission-id={mission_id}"))
+        .arg(format!("--database={}", path.display()))
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "role_agent_rename_failed");
+    let connection = Connection::open(&path).unwrap();
+    let after: (String, String, String, String, i64) = connection
+        .query_row(
+            "SELECT pane_id, terminal_id, health, updated_at,
+                    (SELECT COUNT(*) FROM messages WHERE mission_id = ?1)
+             FROM team_roles WHERE mission_id = ?1 AND role = 'pm'",
+            [&mission_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(after, before);
+
+    cleanup(&path);
+    let _ = fs::remove_file(fake_herdr);
+}
+
+#[test]
+fn join_requires_exact_live_identity_before_repairing_a_stale_binding() {
+    let path = temp_db_path("join-live-identity");
+    let fake_herdr = path.with_extension("herdr");
+    write_executable(
+        &fake_herdr,
+        "#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = rename ]; then exit 0; fi\nif [ \"$1\" = agent ] && [ \"$2\" = rename ]; then exit 0; fi\nif [ \"$1\" = agent ] && [ \"$2\" = list ]; then\n  printf '%s\\n' '{\"result\":{\"agents\":[{\"name\":\"another-agent\",\"pane_id\":\"w19:pC\",\"agent_status\":\"working\"}]}}'\n  exit 0\nfi\nexit 1\n",
+    );
+    let mission_id = create_cli_mission(&path, "Join identity mismatch");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE team_roles
+             SET pane_id = 'w19:pC', terminal_id = 'Codex', health = 'missing'
+             WHERE mission_id = ?1 AND role = 'pm'",
+            [&mission_id],
+        )
+        .unwrap();
+    let before: (String, String, String, String, i64) = connection
+        .query_row(
+            "SELECT pane_id, terminal_id, health, updated_at,
+                    (SELECT COUNT(*) FROM messages WHERE mission_id = ?1)
+             FROM team_roles WHERE mission_id = ?1 AND role = 'pm'",
+            [&mission_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    drop(connection);
+
+    let rejected = Command::new(kernel_binary())
+        .args([
+            "join",
+            "--json",
+            "--role=pm",
+            "--pane=w19:pC",
+            "--agent-name=mission-verified-pm",
+        ])
+        .arg(format!("--mission-id={mission_id}"))
+        .arg(format!("--database={}", path.display()))
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "role_runtime_identity_unverified");
+    let connection = Connection::open(&path).unwrap();
+    let after_rejection: (String, String, String, String, i64) = connection
+        .query_row(
+            "SELECT pane_id, terminal_id, health, updated_at,
+                    (SELECT COUNT(*) FROM messages WHERE mission_id = ?1)
+             FROM team_roles WHERE mission_id = ?1 AND role = 'pm'",
+            [&mission_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(after_rejection, before);
+    drop(connection);
+
+    write_executable(
+        &fake_herdr,
+        "#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = rename ]; then exit 0; fi\nif [ \"$1\" = agent ] && [ \"$2\" = rename ]; then exit 0; fi\nif [ \"$1\" = agent ] && [ \"$2\" = list ]; then\n  printf '%s\\n' '{\"result\":{\"agents\":[{\"name\":\"mission-verified-pm\",\"pane_id\":\"w19:pC\",\"agent_status\":\"working\"}]}}'\n  exit 0\nfi\nexit 1\n",
+    );
+    let repaired = Command::new(kernel_binary())
+        .args([
+            "join",
+            "--json",
+            "--role=pm",
+            "--pane=w19:pC",
+            "--agent-name=mission-verified-pm",
+        ])
+        .arg(format!("--mission-id={mission_id}"))
+        .arg(format!("--database={}", path.display()))
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .output()
+        .unwrap();
+    assert!(
+        repaired.status.success(),
+        "join failed: {}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    let connection = Connection::open(&path).unwrap();
+    let repaired_binding: (String, String, String) = connection
+        .query_row(
+            "SELECT pane_id, terminal_id, health FROM team_roles
+             WHERE mission_id = ?1 AND role = 'pm'",
+            [&mission_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        repaired_binding,
+        ("w19:pC".into(), "mission-verified-pm".into(), "idle".into())
+    );
 
     cleanup(&path);
     let _ = fs::remove_file(fake_herdr);

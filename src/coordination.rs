@@ -18,6 +18,10 @@ use rusqlite::OptionalExtension;
 use serde_json::json;
 
 use crate::creation::reconcile_role_healths_with;
+use crate::peer::{
+    read_peer_inbox, reconcile_peer_relay, PeerInboxMessage, PeerRelayReport, PeerTransport,
+    SystemSshPeerTransport,
+};
 use crate::{
     agent_list_argv, open_writable, parse_agent_list, parse_role_ref, read_generation,
     utc_timestamp, AgentProviderAdapter, AssignmentState, DecisionContext, DriveExecutionMode,
@@ -52,6 +56,7 @@ pub struct RoleContext {
     pub health: String,
     pub pending_assignments: Vec<PendingAssignment>,
     pub inbox: Vec<InboxMessage>,
+    pub peer_inbox: Vec<PeerInboxMessage>,
     pub generation: i64,
 }
 
@@ -66,6 +71,14 @@ pub struct DeliveryReport {
 pub struct ReconcileReport {
     pub health: Result<RoleHealthReconciliation, KernelError>,
     pub delivery: Result<DeliveryReport, KernelError>,
+}
+
+/// Extended reconciliation results for callers that drive the peer relay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerReconcileReport {
+    pub health: Result<RoleHealthReconciliation, KernelError>,
+    pub delivery: Result<DeliveryReport, KernelError>,
+    pub peer: Result<PeerRelayReport, KernelError>,
 }
 
 /// Result of dispatching a command through the kernel state machine.
@@ -158,6 +171,11 @@ pub fn read_role_context(
         .map_err(|error| sqlite_error("sqlite_message_read_failed", "context", error))?;
 
     let generation = read_generation(&connection)?;
+    let peer_inbox = if role == "pm" {
+        read_peer_inbox(database, mission_id, role)?
+    } else {
+        Vec::new()
+    };
 
     Ok(RoleContext {
         mission_id: mission_id.to_string(),
@@ -166,6 +184,7 @@ pub fn read_role_context(
         health,
         pending_assignments,
         inbox,
+        peer_inbox,
         generation,
     })
 }
@@ -482,6 +501,11 @@ pub fn kernel_read_context(
         .unwrap_or_default();
 
     let generation = read_generation(&open_writable(database, OWNER_IDENTITY)?)?;
+    let peer_inbox = if role == "pm" {
+        read_peer_inbox(database, mission_id, role)?
+    } else {
+        Vec::new()
+    };
 
     Ok(RoleContext {
         mission_id: mission_id.to_string(),
@@ -490,6 +514,7 @@ pub fn kernel_read_context(
         health,
         pending_assignments,
         inbox,
+        peer_inbox,
         generation,
     })
 }
@@ -569,6 +594,34 @@ pub fn kernel_reconcile(
         });
     let delivery = kernel_deliver(database, runner, herdr);
     ReconcileReport { health, delivery }
+}
+
+/// Reconcile Team and peer work using the system SSH transport.
+pub fn kernel_reconcile_with_peer(
+    database: &Path,
+    runner: &dyn ProcessRunner,
+    herdr: &str,
+) -> PeerReconcileReport {
+    kernel_reconcile_with_peer_transport(database, runner, herdr, &SystemSshPeerTransport)
+}
+
+/// Reconcile one database while using an injectable peer transport.
+///
+/// Ordinary Team delivery and peer relay intentionally return independent
+/// results so an unreachable peer cannot suppress local Assignment delivery.
+pub fn kernel_reconcile_with_peer_transport(
+    database: &Path,
+    runner: &dyn ProcessRunner,
+    herdr: &str,
+    peer_transport: &dyn PeerTransport,
+) -> PeerReconcileReport {
+    let team = kernel_reconcile(database, runner, herdr);
+    let peer = reconcile_peer_relay(database, peer_transport, runner, herdr);
+    PeerReconcileReport {
+        health: team.health,
+        delivery: team.delivery,
+        peer,
+    }
 }
 
 fn queued_mission_ids(database: &Path) -> Result<Vec<String>, KernelError> {

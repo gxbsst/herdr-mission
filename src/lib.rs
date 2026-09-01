@@ -11,6 +11,7 @@ mod herdr;
 mod keybinding;
 mod log;
 mod manifest;
+mod peer;
 mod prompt;
 mod runtime;
 
@@ -37,8 +38,9 @@ pub use config::{
 };
 pub use coordination::{
     kernel_deliver, kernel_dispatch_command, kernel_read_context, kernel_reconcile,
-    kernel_reply_command, read_role_context, DeliveryReport, InboxMessage, KernelDispatchOutcome,
-    KernelReplyOutcome, PendingAssignment, ReconcileReport, RoleContext,
+    kernel_reconcile_with_peer, kernel_reconcile_with_peer_transport, kernel_reply_command,
+    read_role_context, DeliveryReport, InboxMessage, KernelDispatchOutcome, KernelReplyOutcome,
+    PeerReconcileReport, PendingAssignment, ReconcileReport, RoleContext,
 };
 pub use creation::{
     agent_name_token, create_mission, default_codex_team, delete_mission, is_valid_role_identity,
@@ -71,6 +73,13 @@ pub use log::{log_error, log_event, log_mission_error};
 pub use manifest::{
     compute_manifest, install_atomic, manifest_path_for, read_manifest, sha256_hex, verify_binary,
     write_manifest, ReleaseManifest,
+};
+pub use peer::{
+    acknowledge_peer_message, configure_local_peer, deliver_peer_messages_with,
+    new_peer_message_id, notify_peer_inboxes, queue_peer_message, read_peer_inbox,
+    receive_peer_envelope, reconcile_peer_relay, upsert_peer, upsert_peer_route, PeerEnvelopeV1,
+    PeerInboxMessage, PeerPayloadV1, PeerReceipt, PeerRelayReport, PeerSendOutcome,
+    PeerSendRequest, PeerTransport, SystemSshPeerTransport, MAX_PEER_ENVELOPE_BYTES,
 };
 pub use prompt::role_init_prompt;
 pub use protocol::{
